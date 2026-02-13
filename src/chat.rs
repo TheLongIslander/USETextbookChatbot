@@ -21,6 +21,7 @@ struct ContextSource {
     source_id: String,
     result: RetrievalResult,
     part: Option<String>,
+    rowid: Option<i64>,
 }
 
 #[derive(Clone)]
@@ -75,7 +76,21 @@ impl ChatService {
             .boost_with_anchor_matches(&resolved_question, retrieved)
             .await?;
 
-        let selected = trim_to_context_budget(retrieved, self.config.tokens.max_context_tokens, 10);
+        let broad_query = is_overview_query(&resolved_question)
+            || is_later_query(&resolved_question)
+            || is_part_query(&resolved_question);
+        let pre_context_tokens = if broad_query {
+            self.config.tokens.max_context_tokens.saturating_mul(2)
+        } else {
+            self.config.tokens.max_context_tokens
+        };
+        let pre_context_chunks = if broad_query { 24 } else { 12 };
+        let selected = trim_to_context_budget(
+            &resolved_question,
+            retrieved,
+            pre_context_tokens,
+            pre_context_chunks,
+        );
 
         if selected.is_empty() {
             let answer = ChatAnswer {
@@ -94,7 +109,28 @@ impl ChatService {
         }
 
         let mut mode = AnswerMode::TextOnly;
-        let context_sources = self.build_context_sources(selected).await?;
+        let mut context_sources = self.build_context_sources(selected).await?;
+        context_sources = rebalance_context_sources(
+            &resolved_question,
+            context_sources,
+            self.config.tokens.max_context_tokens,
+            10,
+        );
+        if context_sources.is_empty() {
+            let answer = ChatAnswer {
+                answer_markdown: NOT_FOUND_MESSAGE.to_string(),
+                citations: vec![],
+                mode: AnswerMode::TextOnly,
+                confidence: 0.0,
+                latency_ms: started.elapsed().as_millis(),
+            };
+
+            self.db
+                .save_message(&request.session_id, "assistant", &answer.answer_markdown)
+                .await
+                .map_err(anyhow::Error::from)?;
+            return Ok(answer);
+        }
         let (mut context, _) = build_context(&context_sources);
         let source_ids: Vec<String> = context_sources
             .iter()
@@ -314,17 +350,34 @@ impl ChatService {
         retrieved: Vec<RetrievalResult>,
     ) -> Result<Vec<RetrievalResult>> {
         let anchors = extract_anchor_terms(question);
-        if anchors.is_empty() {
+        let strong_anchors = extract_strong_anchor_terms(question);
+        let anchor_terms = if anchors.is_empty() {
+            strong_anchors.clone()
+        } else {
+            anchors.clone()
+        };
+
+        if anchor_terms.is_empty() {
             return Ok(retrieved);
         }
 
         let question_terms = normalized_question_terms(question);
         let death_question = is_death_question(question);
-        let lexical_candidates = self.db.search_chunks_by_terms(&anchors, 160).await?;
+        let lexical_candidates = self.db.search_chunks_by_terms(&anchor_terms, 240).await?;
+        let conjunctive_terms = pick_conjunctive_terms(&strong_anchors, &anchor_terms);
+        let lexical_all_candidates = if conjunctive_terms.len() >= 2 {
+            self.db
+                .search_chunks_by_all_terms(&conjunctive_terms, 120)
+                .await?
+        } else {
+            vec![]
+        };
         let include_timeline =
             is_overview_query(question) || is_later_query(question) || is_part_query(question);
         let timeline_candidates = if include_timeline {
-            self.db.search_chunks_by_terms_chrono(&anchors, 320).await?
+            self.db
+                .search_chunks_by_terms_chrono(&anchor_terms, 420)
+                .await?
         } else {
             vec![]
         };
@@ -340,11 +393,33 @@ impl ChatService {
                 continue;
             }
 
-            if has_any_term(&chunk.content, &anchors) {
+            if has_any_term(&chunk.content, &anchor_terms) {
                 bonus += 0.06;
             }
             if death_question && contains_death_terms(&chunk.content) {
                 bonus += 0.18;
+            }
+
+            if let Some(existing) = merged.get_mut(&chunk.id) {
+                existing.score += bonus;
+            } else {
+                merged.insert(
+                    chunk.id.clone(),
+                    RetrievalResult {
+                        chunk,
+                        score: bonus,
+                    },
+                );
+            }
+        }
+
+        for chunk in lexical_all_candidates {
+            let mut bonus = lexical_overlap_score(&chunk.content, &question_terms) + 0.16;
+            if has_all_terms(&chunk.content, &conjunctive_terms) {
+                bonus += 0.10;
+            }
+            if death_question && contains_death_terms(&chunk.content) {
+                bonus += 0.12;
             }
 
             if let Some(existing) = merged.get_mut(&chunk.id) {
@@ -368,7 +443,7 @@ impl ChatService {
                 if is_later_query(question) {
                     bonus += 0.05;
                 }
-                if has_any_term(&chunk.content, &anchors) {
+                if has_any_term(&chunk.content, &anchor_terms) {
                     bonus += 0.04;
                 }
 
@@ -412,6 +487,7 @@ impl ChatService {
                 source_id,
                 result: item,
                 part,
+                rowid,
             });
         }
 
@@ -577,14 +653,82 @@ fn sanitize_model_output(answer: String) -> String {
 
 fn expand_question_for_retrieval(question: &str) -> String {
     let mut expanded = question.to_string();
+    let mut additions = Vec::new();
+    let mut seen = HashSet::new();
+
     if is_death_question(question) {
-        expanded.push_str(" killed kill died death dead slain executed");
+        for term in [
+            "killed", "kill", "died", "death", "dead", "slain", "executed", "murdered",
+        ] {
+            push_unique_term(&mut additions, &mut seen, term);
+        }
+    }
+
+    if is_when_question(question) {
+        for term in [
+            "timeline", "date", "time", "part", "chapter", "before", "after",
+        ] {
+            push_unique_term(&mut additions, &mut seen, term);
+        }
+    }
+
+    let q = question.to_ascii_lowercase();
+    if [
+        "arrive", "arrival", "reached", "reach", "went", "go to", "travel", "sailed",
+    ]
+    .iter()
+    .any(|needle| q.contains(needle))
+    {
+        for term in [
+            "arrive", "arrived", "reached", "went", "travel", "sailed", "journey", "moved",
+        ] {
+            push_unique_term(&mut additions, &mut seen, term);
+        }
+    }
+
+    if q.contains(" in ") || q.contains(" to ") || q.contains(" from ") {
+        for term in ["location", "place", "city", "country", "island", "region"] {
+            push_unique_term(&mut additions, &mut seen, term);
+        }
+    }
+
+    if is_part_query(question) {
+        for term in ["part", "chapter", "section", "timeline"] {
+            push_unique_term(&mut additions, &mut seen, term);
+        }
+    }
+
+    if is_overview_query(question) {
+        for term in [
+            "overview",
+            "summary",
+            "arc",
+            "beginning",
+            "middle",
+            "end",
+            "later",
+        ] {
+            push_unique_term(&mut additions, &mut seen, term);
+        }
+    }
+
+    if is_later_query(question) {
+        for term in ["later", "end", "final", "aftermath", "eventually"] {
+            push_unique_term(&mut additions, &mut seen, term);
+        }
     }
 
     let anchors = extract_anchor_terms(question);
-    if !anchors.is_empty() {
+    for anchor in anchors {
+        push_unique_term(&mut additions, &mut seen, &anchor);
+    }
+    for phrase in extract_phrase_anchors(question) {
+        push_unique_term(&mut additions, &mut seen, &phrase);
+    }
+
+    if !additions.is_empty() {
         expanded.push(' ');
-        expanded.push_str(&anchors.join(" "));
+        expanded.push_str(&additions.join(" "));
     }
     expanded
 }
@@ -643,12 +787,7 @@ fn select_timeline_chunks(
 
 fn extract_anchor_terms(question: &str) -> Vec<String> {
     let token_re = Regex::new(r"[A-Za-z0-9_]+").unwrap_or_else(|_| Regex::new("^").unwrap());
-    let stopwords: HashSet<&'static str> = [
-        "when", "what", "who", "where", "why", "how", "did", "does", "is", "are", "was", "were",
-        "the", "a", "an", "in", "on", "to", "of", "for", "it", "its", "and", "or", "if", "then",
-    ]
-    .into_iter()
-    .collect();
+    let stopwords = anchor_stopwords();
 
     let mut seen = HashSet::new();
     let mut out = Vec::new();
@@ -659,15 +798,63 @@ fn extract_anchor_terms(question: &str) -> Vec<String> {
             continue;
         }
 
-        let looks_like_entity = raw.chars().any(|c| c.is_ascii_digit())
-            || (raw.len() >= 8 && raw.chars().any(|c| c.is_ascii_uppercase()));
-        let useful_long_token = raw.len() >= 7;
-        if !looks_like_entity && !useful_long_token {
+        let has_digit = raw.chars().any(|c| c.is_ascii_digit());
+        let has_internal_upper = raw.chars().skip(1).any(|c| c.is_ascii_uppercase());
+        let useful_length = raw.len() >= 4;
+        if !has_digit && !has_internal_upper && !useful_length {
             continue;
         }
 
         if seen.insert(lower.clone()) {
             out.push(lower);
+        }
+    }
+
+    for phrase in extract_phrase_anchors(question) {
+        if seen.insert(phrase.clone()) {
+            out.push(phrase);
+        }
+    }
+
+    out
+}
+
+fn extract_strong_anchor_terms(question: &str) -> Vec<String> {
+    let token_re = Regex::new(r"[A-Za-z0-9_]+").unwrap_or_else(|_| Regex::new("^").unwrap());
+    let stopwords = anchor_stopwords();
+
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+
+    for m in token_re.find_iter(question) {
+        let raw = m.as_str();
+        let lower = raw.to_ascii_lowercase();
+        if stopwords.contains(lower.as_str()) {
+            continue;
+        }
+
+        let has_digit = raw.chars().any(|c| c.is_ascii_digit());
+        let has_internal_upper = raw.chars().skip(1).any(|c| c.is_ascii_uppercase());
+        if has_digit || has_internal_upper {
+            if seen.insert(lower.clone()) {
+                out.push(lower);
+            }
+        }
+    }
+
+    let loc_re =
+        Regex::new(r"(?i)\b(?:in|to|from|at)\s+([A-Z][A-Za-z0-9_]*(?:\s+[A-Z][A-Za-z0-9_]*)?)\b")
+            .unwrap_or_else(|_| Regex::new("^$").unwrap());
+    for caps in loc_re.captures_iter(question) {
+        let Some(m) = caps.get(1) else {
+            continue;
+        };
+        let phrase = m.as_str().trim().to_ascii_lowercase();
+        if phrase.len() < 4 {
+            continue;
+        }
+        if seen.insert(phrase.clone()) {
+            out.push(phrase);
         }
     }
 
@@ -736,12 +923,136 @@ fn has_any_term(content: &str, terms: &[String]) -> bool {
         .any(|term| content_lower.contains(term.as_str()))
 }
 
+fn has_all_terms(content: &str, terms: &[String]) -> bool {
+    if terms.is_empty() {
+        return false;
+    }
+    let content_lower = content.to_ascii_lowercase();
+    terms
+        .iter()
+        .all(|term| content_lower.contains(term.as_str()))
+}
+
+fn extract_phrase_anchors(question: &str) -> Vec<String> {
+    let re = Regex::new(r"\b([A-Z][A-Za-z0-9_]+(?:\s+[A-Z][A-Za-z0-9_]+)+)\b")
+        .unwrap_or_else(|_| Regex::new("^$").unwrap());
+
+    let mut seen = HashSet::new();
+    let mut phrases = Vec::new();
+    for caps in re.captures_iter(question) {
+        let Some(m) = caps.get(1) else {
+            continue;
+        };
+        let phrase = m.as_str().trim().to_ascii_lowercase();
+        if phrase.len() < 5 {
+            continue;
+        }
+        if seen.insert(phrase.clone()) {
+            phrases.push(phrase);
+        }
+    }
+    phrases
+}
+
+fn anchor_stopwords() -> HashSet<&'static str> {
+    [
+        "when",
+        "what",
+        "who",
+        "where",
+        "why",
+        "how",
+        "did",
+        "does",
+        "is",
+        "are",
+        "was",
+        "were",
+        "the",
+        "a",
+        "an",
+        "in",
+        "on",
+        "to",
+        "of",
+        "for",
+        "it",
+        "its",
+        "and",
+        "or",
+        "if",
+        "then",
+        "about",
+        "book",
+        "novel",
+        "story",
+        "context",
+        "provided",
+        "give",
+        "more",
+        "information",
+        "tell",
+        "please",
+    ]
+    .into_iter()
+    .collect()
+}
+
+fn pick_conjunctive_terms(strong: &[String], anchors: &[String]) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+
+    for term in strong {
+        if seen.insert(term.clone()) {
+            out.push(term.clone());
+        }
+    }
+
+    for term in anchors {
+        if out.len() >= 3 {
+            break;
+        }
+        if term.len() < 4 || is_generic_conjunctive_term(term) {
+            continue;
+        }
+        if seen.insert(term.clone()) {
+            out.push(term.clone());
+        }
+    }
+
+    out
+}
+
+fn is_generic_conjunctive_term(term: &str) -> bool {
+    [
+        "later",
+        "overall",
+        "summary",
+        "character",
+        "chapter",
+        "part",
+        "event",
+        "happened",
+        "happen",
+        "arrive",
+        "arrived",
+        "went",
+        "go",
+        "time",
+        "date",
+    ]
+    .contains(&term)
+}
+
 fn is_overview_query(question: &str) -> bool {
     let q = question.to_ascii_lowercase();
     q.starts_with("who is ")
         || q.contains("overall summary")
         || q.contains("summarize")
         || q.contains("character arc")
+        || q.contains("tell me about")
+        || q.contains("more information about")
+        || q.contains("profile of")
 }
 
 fn is_later_query(question: &str) -> bool {
@@ -750,6 +1061,10 @@ fn is_later_query(question: &str) -> bool {
         || q.contains("later on")
         || q.contains("towards the end")
         || q.contains("at the end")
+        || q.contains("later")
+        || q.contains("eventually")
+        || q.contains("after this")
+        || q.contains("after that")
 }
 
 fn is_part_query(question: &str) -> bool {
@@ -869,23 +1184,228 @@ fn has_image_keywords(question: &str) -> bool {
 }
 
 fn trim_to_context_budget(
+    question: &str,
     retrieved: Vec<RetrievalResult>,
     max_tokens: usize,
     max_chunks: usize,
 ) -> Vec<RetrievalResult> {
-    let mut kept = Vec::new();
-    let mut total_tokens = 0usize;
+    if max_tokens == 0 || max_chunks == 0 {
+        return vec![];
+    }
 
-    for item in retrieved.into_iter().take(max_chunks) {
-        let chunk_tokens = item.chunk.token_count as usize;
-        if total_tokens + chunk_tokens > max_tokens {
+    let broad_query =
+        is_overview_query(question) || is_later_query(question) || is_part_query(question);
+    let candidates: Vec<RetrievalResult> = retrieved
+        .into_iter()
+        .take(max_chunks.saturating_mul(6).max(max_chunks))
+        .collect();
+
+    if candidates.is_empty() {
+        return vec![];
+    }
+
+    let mut kept = Vec::new();
+    let mut seen_ids: HashSet<String> = HashSet::new();
+    let mut bucket_counts: HashMap<String, usize> = HashMap::new();
+    let mut total_tokens = 0usize;
+    let bucket_quota = if broad_query { 1 } else { 2 };
+
+    for pass in 0..2 {
+        for item in &candidates {
+            if kept.len() >= max_chunks {
+                break;
+            }
+
+            if seen_ids.contains(&item.chunk.id) {
+                continue;
+            }
+
+            let chunk_tokens = item.chunk.token_count as usize;
+            if chunk_tokens > max_tokens || total_tokens + chunk_tokens > max_tokens {
+                continue;
+            }
+
+            let bucket = diversity_bucket(&item.chunk);
+            let bucket_count = bucket_counts.get(&bucket).copied().unwrap_or(0);
+            if pass == 0 && bucket_count >= bucket_quota {
+                continue;
+            }
+
+            total_tokens += chunk_tokens;
+            seen_ids.insert(item.chunk.id.clone());
+            *bucket_counts.entry(bucket).or_insert(0) += 1;
+            kept.push(item.clone());
+        }
+        if kept.len() >= max_chunks {
             break;
         }
-        total_tokens += chunk_tokens;
-        kept.push(item);
     }
 
     kept
+}
+
+fn diversity_bucket(chunk: &crate::models::Chunk) -> String {
+    if let Some(chapter) = &chunk.chapter {
+        let trimmed = chapter.trim();
+        if !trimmed.is_empty() {
+            return format!("chapter:{trimmed}");
+        }
+    }
+
+    if let Some(page) = chunk.page {
+        return format!("page:{}", page / 5);
+    }
+
+    format!("kind:{}", chunk.kind.as_str())
+}
+
+fn push_unique_term(terms: &mut Vec<String>, seen: &mut HashSet<String>, term: &str) {
+    let cleaned = term.trim().to_ascii_lowercase();
+    if cleaned.is_empty() {
+        return;
+    }
+    if seen.insert(cleaned.clone()) {
+        terms.push(cleaned);
+    }
+}
+
+fn rebalance_context_sources(
+    question: &str,
+    sources: Vec<ContextSource>,
+    max_tokens: usize,
+    max_chunks: usize,
+) -> Vec<ContextSource> {
+    if max_tokens == 0 || max_chunks == 0 || sources.is_empty() {
+        return vec![];
+    }
+
+    let broad_query =
+        is_overview_query(question) || is_later_query(question) || is_part_query(question);
+    if !broad_query {
+        let mut out = trim_context_sources_by_budget(sources, max_tokens, max_chunks);
+        renumber_sources(&mut out);
+        return out;
+    }
+
+    let mut ranked = sources;
+    ranked.sort_by(|a, b| {
+        b.result
+            .score
+            .partial_cmp(&a.result.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    let rowids: Vec<i64> = ranked.iter().filter_map(|s| s.rowid).collect();
+    if rowids.len() < 4 {
+        let mut out = trim_context_sources_by_budget(ranked, max_tokens, max_chunks);
+        renumber_sources(&mut out);
+        return out;
+    }
+
+    let min_rowid = rowids.iter().copied().min().unwrap_or(0);
+    let max_rowid = rowids.iter().copied().max().unwrap_or(min_rowid);
+    let later_bias = is_later_query(question) || question.to_ascii_lowercase().contains("latest");
+    let quotas: [usize; 3] = if later_bias { [1, 2, 4] } else { [2, 2, 2] };
+
+    let mut selected = Vec::new();
+    let mut bucket_counts = [0usize; 3];
+    let mut seen = HashSet::new();
+    let mut total_tokens = 0usize;
+
+    for src in &ranked {
+        if selected.len() >= max_chunks {
+            break;
+        }
+
+        let chunk_tokens = src.result.chunk.token_count.max(0) as usize;
+        if chunk_tokens > max_tokens || total_tokens + chunk_tokens > max_tokens {
+            continue;
+        }
+
+        let bucket = temporal_bucket(src.rowid, min_rowid, max_rowid);
+        if bucket_counts[bucket] >= quotas[bucket] {
+            continue;
+        }
+
+        if seen.insert(src.result.chunk.id.clone()) {
+            selected.push(src.clone());
+            bucket_counts[bucket] += 1;
+            total_tokens += chunk_tokens;
+        }
+    }
+
+    for src in &ranked {
+        if selected.len() >= max_chunks {
+            break;
+        }
+
+        if seen.contains(&src.result.chunk.id) {
+            continue;
+        }
+
+        let chunk_tokens = src.result.chunk.token_count.max(0) as usize;
+        if chunk_tokens > max_tokens || total_tokens + chunk_tokens > max_tokens {
+            continue;
+        }
+
+        if seen.insert(src.result.chunk.id.clone()) {
+            selected.push(src.clone());
+            total_tokens += chunk_tokens;
+        }
+    }
+
+    selected.sort_by(|a, b| {
+        let a_row = a.rowid.unwrap_or(i64::MAX);
+        let b_row = b.rowid.unwrap_or(i64::MAX);
+        a_row.cmp(&b_row)
+    });
+
+    renumber_sources(&mut selected);
+    selected
+}
+
+fn trim_context_sources_by_budget(
+    sources: Vec<ContextSource>,
+    max_tokens: usize,
+    max_chunks: usize,
+) -> Vec<ContextSource> {
+    let mut kept = Vec::new();
+    let mut total_tokens = 0usize;
+
+    for src in sources {
+        if kept.len() >= max_chunks {
+            break;
+        }
+        let chunk_tokens = src.result.chunk.token_count.max(0) as usize;
+        if chunk_tokens > max_tokens || total_tokens + chunk_tokens > max_tokens {
+            continue;
+        }
+        total_tokens += chunk_tokens;
+        kept.push(src);
+    }
+
+    kept
+}
+
+fn temporal_bucket(rowid: Option<i64>, min_rowid: i64, max_rowid: i64) -> usize {
+    let Some(row) = rowid else {
+        return 1;
+    };
+    let span = (max_rowid - min_rowid).max(1) as f32;
+    let position = (row - min_rowid) as f32 / span;
+    if position < 0.34 {
+        0
+    } else if position < 0.67 {
+        1
+    } else {
+        2
+    }
+}
+
+fn renumber_sources(sources: &mut [ContextSource]) {
+    for (idx, source) in sources.iter_mut().enumerate() {
+        source.source_id = format!("S{}", idx + 1);
+    }
 }
 
 fn build_context(sources: &[ContextSource]) -> (String, Vec<String>) {
@@ -894,7 +1414,7 @@ fn build_context(sources: &[ContextSource]) -> (String, Vec<String>) {
 
     for source in sources {
         context.push_str(&format!(
-            "[{}] chunk_id={} kind={} chapter={} part={} page={}\n{}\n\n",
+            "[{}] chunk_id={} kind={} chapter={} part={} page={} rowid={}\n{}\n\n",
             source.source_id,
             source.result.chunk.id,
             source.result.chunk.kind.as_str(),
@@ -910,6 +1430,10 @@ fn build_context(sources: &[ContextSource]) -> (String, Vec<String>) {
                 .chunk
                 .page
                 .map(|p| p.to_string())
+                .unwrap_or_else(|| "-".to_string()),
+            source
+                .rowid
+                .map(|v| v.to_string())
                 .unwrap_or_else(|| "-".to_string()),
             source.result.chunk.content
         ));
@@ -932,19 +1456,28 @@ fn build_answer_prompt(
         .map(|(role, text)| format!("{role}: {text}"))
         .collect::<Vec<_>>()
         .join("\n");
+    let synthesis_hint = if is_overview_query(question) || is_later_query(question) {
+        "When answering character/overview questions, explicitly cover early, middle, and most recent events. Prioritize the latest canon events if there is tension."
+    } else {
+        ""
+    };
 
     let strict_rules = if strict {
         format!(
             "Rules: Use only the provided context. Cite sources inline like [S1] for every factual sentence. \
              Allowed source tags: {}. If evidence is missing, respond exactly: {NOT_FOUND_MESSAGE}. \
              For overview/later questions, synthesize across early, middle, and late evidence. \
-             Never wrap your answer in code fences.",
-            source_ids.join(", ")
+             Never wrap your answer in code fences. {}",
+            source_ids.join(", "),
+            synthesis_hint
         )
     } else {
-        "Rules: Prefer the provided context. Do not invent events or facts. If context is inconclusive, explicitly say so. \
-         Cite source tags like [S1] when possible. For overview/later questions, synthesize across early, middle, and late evidence. \
-         Never wrap your answer in code fences.".to_string()
+        format!(
+            "Rules: Prefer the provided context. Do not invent events or facts. If context is inconclusive, explicitly say so. \
+             Cite source tags like [S1] when possible. For overview/later questions, synthesize across early, middle, and late evidence. \
+             Never wrap your answer in code fences. {}",
+            synthesis_hint
+        )
     };
 
     format!(
@@ -1111,6 +1644,7 @@ mod tests {
             source_id: "S1".to_string(),
             result: retrieved[0].clone(),
             part: Some("Part 2".to_string()),
+            rowid: Some(20),
         }];
         let citations = build_citations(&mapped, "Answer with evidence [S1].", true);
 
@@ -1146,6 +1680,7 @@ mod tests {
             source_id: "S1".to_string(),
             result: retrieved,
             part: Some("Part 1".to_string()),
+            rowid: Some(5),
         }];
 
         let answer = direct_death_answer_from_sources("When did Apollo345 die?", &mapped)
@@ -1164,7 +1699,10 @@ mod tests {
     #[test]
     fn part_marker_is_normalized() {
         assert_eq!(normalize_part_marker("Part 7a").as_deref(), Some("Part 7A"));
-        assert_eq!(normalize_part_marker("\u{200B} Part 3 ").as_deref(), Some("Part 3"));
+        assert_eq!(
+            normalize_part_marker("\u{200B} Part 3 ").as_deref(),
+            Some("Part 3")
+        );
     }
 
     #[test]
@@ -1186,12 +1724,93 @@ mod tests {
                 score: 0.7,
             },
             part: Some("Part 7A".to_string()),
+            rowid: Some(140),
         };
 
-        let answer =
-            direct_part_answer_from_sources("When did AggravatedCow go to Cuba? Which part of the book?", &[source])
-                .expect("expected part answer");
+        let answer = direct_part_answer_from_sources(
+            "When did AggravatedCow go to Cuba? Which part of the book?",
+            &[source],
+        )
+        .expect("expected part answer");
         assert!(answer.contains("Part 7A"));
         assert!(answer.contains("[S1]"));
+    }
+
+    #[test]
+    fn rebalance_prefers_temporal_coverage_for_overview() {
+        let make_source = |id: &str, score: f32, rowid: i64| ContextSource {
+            source_id: "S0".to_string(),
+            result: RetrievalResult {
+                chunk: Chunk {
+                    id: id.to_string(),
+                    content: format!("TheLongIslander event {id}"),
+                    kind: SourceType::DocxText,
+                    chapter: None,
+                    page: None,
+                    token_count: 30,
+                    source_hash: "h".to_string(),
+                    image_path: None,
+                },
+                score,
+            },
+            part: None,
+            rowid: Some(rowid),
+        };
+
+        let sources = vec![
+            make_source("a", 0.95, 10),
+            make_source("b", 0.90, 15),
+            make_source("c", 0.85, 20),
+            make_source("d", 0.80, 120),
+            make_source("e", 0.75, 130),
+            make_source("f", 0.70, 240),
+            make_source("g", 0.65, 250),
+        ];
+
+        let selected = rebalance_context_sources("Who is TheLongIslander?", sources, 220, 6);
+        assert!(!selected.is_empty());
+        assert!(selected.iter().any(|s| s.rowid.unwrap_or(0) >= 200));
+        assert!(selected.iter().any(|s| s.rowid.unwrap_or(0) <= 30));
+        assert_eq!(selected[0].source_id, "S1");
+    }
+
+    #[test]
+    fn rebalance_later_query_biases_late_chunks() {
+        let make_source = |id: &str, score: f32, rowid: i64| ContextSource {
+            source_id: "S0".to_string(),
+            result: RetrievalResult {
+                chunk: Chunk {
+                    id: id.to_string(),
+                    content: format!("Arc event {id}"),
+                    kind: SourceType::DocxText,
+                    chapter: None,
+                    page: None,
+                    token_count: 28,
+                    source_hash: "h".to_string(),
+                    image_path: None,
+                },
+                score,
+            },
+            part: None,
+            rowid: Some(rowid),
+        };
+
+        let sources = vec![
+            make_source("a", 1.00, 20),
+            make_source("b", 0.98, 30),
+            make_source("c", 0.96, 45),
+            make_source("d", 0.80, 180),
+            make_source("e", 0.70, 240),
+            make_source("f", 0.68, 260),
+            make_source("g", 0.66, 280),
+        ];
+
+        let selected =
+            rebalance_context_sources("What does he do later in the novel?", sources, 210, 6);
+        let late_count = selected
+            .iter()
+            .filter(|s| s.rowid.unwrap_or(0) >= 180)
+            .count();
+        assert!(late_count >= 3);
     }
 }

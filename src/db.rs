@@ -177,6 +177,34 @@ impl Database {
         Ok(rows.into_iter().map(row_to_chunk).collect())
     }
 
+    pub async fn search_chunks_by_all_terms(
+        &self,
+        terms: &[String],
+        limit: i64,
+    ) -> Result<Vec<Chunk>> {
+        if terms.is_empty() || limit <= 0 {
+            return Ok(vec![]);
+        }
+
+        let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new(
+            "SELECT id, content, kind, chapter, page, token_count, source_hash, image_path FROM chunks WHERE ",
+        );
+
+        for (idx, term) in terms.iter().enumerate() {
+            if idx > 0 {
+                qb.push(" AND ");
+            }
+            qb.push("lower(content) LIKE ");
+            qb.push_bind(format!("%{}%", term.to_ascii_lowercase()));
+        }
+
+        qb.push(" ORDER BY rowid ASC LIMIT ");
+        qb.push_bind(limit);
+
+        let rows: Vec<SqliteRow> = qb.build().fetch_all(&self.pool).await?;
+        Ok(rows.into_iter().map(row_to_chunk).collect())
+    }
+
     pub async fn search_chunks_by_terms_chrono(
         &self,
         terms: &[String],

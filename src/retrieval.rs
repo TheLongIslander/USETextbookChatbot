@@ -9,6 +9,9 @@ use crate::ollama::OllamaClient;
 use crate::qdrant_store::QdrantStore;
 use crate::tantivy_store::TantivyStore;
 
+const VECTOR_RECALL_K: usize = 72;
+const BM25_RECALL_K: usize = 72;
+
 #[derive(Clone)]
 pub struct Retriever {
     db: Database,
@@ -37,11 +40,14 @@ impl Retriever {
 
     pub async fn retrieve(&self, query: &str, top_k: usize) -> Result<Vec<RetrievalResult>> {
         let embedding = self.ollama.embed(&self.embedding_model, query).await?;
-        let qdrant_fut = self.qdrant.search(&embedding, 24);
+        let recall_k = top_k.saturating_mul(3).max(VECTOR_RECALL_K);
+        let qdrant_fut = self.qdrant.search(&embedding, recall_k);
 
         let tantivy = self.tantivy.clone();
         let query_text = query.to_string();
-        let bm25_fut = tokio::task::spawn_blocking(move || tantivy.search(&query_text, 24));
+        let bm25_recall_k = top_k.saturating_mul(3).max(BM25_RECALL_K);
+        let bm25_fut =
+            tokio::task::spawn_blocking(move || tantivy.search(&query_text, bm25_recall_k));
 
         let (vector_hits, bm25_hits) = tokio::join!(qdrant_fut, bm25_fut);
 
@@ -50,14 +56,19 @@ impl Retriever {
 
         let mut fused_scores: HashMap<String, f32> = HashMap::new();
         let rrf_k = 60.0f32;
+        let (vector_weight, bm25_weight) = fusion_weights_for_query(query);
 
         for (rank, hit) in vector_hits.iter().enumerate() {
-            let score = 1.0 / (rrf_k + (rank + 1) as f32);
+            let rank_score = vector_weight / (rrf_k + (rank + 1) as f32);
+            let similarity_bonus = hit.score.clamp(0.0, 1.0) * 0.04;
+            let score = rank_score + similarity_bonus;
             *fused_scores.entry(hit.chunk_id.clone()).or_insert(0.0) += score;
         }
 
-        for (rank, (chunk_id, _score)) in bm25_hits.iter().enumerate() {
-            let score = 1.0 / (rrf_k + (rank + 1) as f32);
+        for (rank, (chunk_id, raw_score)) in bm25_hits.iter().enumerate() {
+            let rank_score = bm25_weight / (rrf_k + (rank + 1) as f32);
+            let lexical_bonus = raw_score.max(0.0).ln_1p() * 0.012;
+            let score = rank_score + lexical_bonus;
             *fused_scores.entry(chunk_id.clone()).or_insert(0.0) += score;
         }
 
@@ -86,5 +97,48 @@ impl Retriever {
 
         out.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal));
         Ok(out)
+    }
+}
+
+fn fusion_weights_for_query(query: &str) -> (f32, f32) {
+    let lower = query.to_ascii_lowercase();
+    let lexical_intent = [
+        "when ",
+        "where ",
+        "which part",
+        "what part",
+        "date",
+        "year",
+        "arrive",
+        "arrival",
+        "reached",
+        "went",
+        "go to",
+        "in ",
+        "to ",
+        "chapter",
+        "part ",
+        "killed",
+        "died",
+        "who is",
+    ]
+    .iter()
+    .any(|term| lower.contains(term));
+
+    let semantic_intent = ["theme", "motif", "symbol", "tone", "meaning", "message"]
+        .iter()
+        .any(|term| lower.contains(term));
+
+    let entity_signal = query.chars().any(|c| c.is_ascii_digit())
+        || query
+            .split_whitespace()
+            .any(|tok| tok.chars().skip(1).any(|c| c.is_ascii_uppercase()));
+
+    if semantic_intent {
+        (1.2, 0.95)
+    } else if lexical_intent || entity_signal {
+        (0.95, 1.35)
+    } else {
+        (1.0, 1.0)
     }
 }

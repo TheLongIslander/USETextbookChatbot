@@ -62,11 +62,11 @@ impl AppConfig {
                 chunk_target_tokens: env::var("CHUNK_TARGET_TOKENS")
                     .ok()
                     .and_then(|v| v.parse().ok())
-                    .unwrap_or(600),
+                    .unwrap_or(420),
                 chunk_overlap_tokens: env::var("CHUNK_OVERLAP_TOKENS")
                     .ok()
                     .and_then(|v| v.parse().ok())
-                    .unwrap_or(80),
+                    .unwrap_or(70),
             },
         }
     }
