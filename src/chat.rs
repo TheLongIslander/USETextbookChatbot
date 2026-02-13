@@ -21,6 +21,7 @@ struct ContextSource {
     source_id: String,
     result: RetrievalResult,
     part: Option<String>,
+    part_index: Option<i64>,
     rowid: Option<i64>,
 }
 
@@ -71,14 +72,18 @@ impl ChatService {
         let resolved_question = resolve_question_with_history(&request.question, &recent_history);
         let query_class = self.classify_query(&resolved_question).await;
         let expanded_question = expand_question_for_retrieval(&resolved_question);
-        let retrieved = self.retriever.retrieve(&expanded_question, 24).await?;
+        let broad_retrieval = is_broad_retrieval_query(&resolved_question);
+        let retrieve_k = if broad_retrieval { 72 } else { 24 };
+        let retrieved = self
+            .retriever
+            .retrieve(&expanded_question, retrieve_k)
+            .await?;
         let retrieved = self
             .boost_with_anchor_matches(&resolved_question, retrieved)
             .await?;
+        let retrieved = rerank_candidates(&resolved_question, retrieved);
 
-        let broad_query = is_overview_query(&resolved_question)
-            || is_later_query(&resolved_question)
-            || is_part_query(&resolved_question);
+        let broad_query = broad_retrieval;
         let pre_context_tokens = if broad_query {
             self.config.tokens.max_context_tokens.saturating_mul(2)
         } else {
@@ -178,6 +183,7 @@ impl ChatService {
             &context,
             &history,
             request.strict,
+            request.verbose,
             &source_ids,
             self.config.tokens.max_output_tokens,
         );
@@ -375,9 +381,7 @@ impl ChatService {
         let include_timeline =
             is_overview_query(question) || is_later_query(question) || is_part_query(question);
         let timeline_candidates = if include_timeline {
-            self.db
-                .search_chunks_by_terms_chrono(&anchor_terms, 420)
-                .await?
+            self.collect_timeline_candidates(&anchor_terms, 220).await?
         } else {
             vec![]
         };
@@ -400,17 +404,7 @@ impl ChatService {
                 bonus += 0.18;
             }
 
-            if let Some(existing) = merged.get_mut(&chunk.id) {
-                existing.score += bonus;
-            } else {
-                merged.insert(
-                    chunk.id.clone(),
-                    RetrievalResult {
-                        chunk,
-                        score: bonus,
-                    },
-                );
-            }
+            add_or_insert_result(&mut merged, chunk, bonus);
         }
 
         for chunk in lexical_all_candidates {
@@ -422,22 +416,12 @@ impl ChatService {
                 bonus += 0.12;
             }
 
-            if let Some(existing) = merged.get_mut(&chunk.id) {
-                existing.score += bonus;
-            } else {
-                merged.insert(
-                    chunk.id.clone(),
-                    RetrievalResult {
-                        chunk,
-                        score: bonus,
-                    },
-                );
-            }
+            add_or_insert_result(&mut merged, chunk, bonus);
         }
 
         if include_timeline {
             let timeline_selected =
-                select_timeline_chunks(&timeline_candidates, 12, is_later_query(question));
+                select_timeline_chunks(&timeline_candidates, 18, is_later_query(question));
             for (index, (_rowid, chunk)) in timeline_selected.into_iter().enumerate() {
                 let mut bonus = 0.08 + 0.01 * (index as f32);
                 if is_later_query(question) {
@@ -447,16 +431,32 @@ impl ChatService {
                     bonus += 0.04;
                 }
 
-                if let Some(existing) = merged.get_mut(&chunk.id) {
-                    existing.score += bonus;
-                } else {
-                    merged.insert(
-                        chunk.id.clone(),
-                        RetrievalResult {
-                            chunk,
-                            score: bonus,
-                        },
-                    );
+                add_or_insert_result(&mut merged, chunk, bonus);
+            }
+        }
+
+        if let Some(entity) = summary_focus_entity(question, &strong_anchors, &anchor_terms) {
+            let entity_hits = self.db.entity_hits(&entity, 720).await?;
+            if !entity_hits.is_empty() {
+                let spine = select_entity_summary_spine(&entity_hits, is_later_query(question), 16);
+                for hit in entity_hits.iter().take(240) {
+                    let mut bonus = 0.06 + (hit.mention_count.max(1) as f32).ln_1p() * 0.05;
+                    if is_later_query(question)
+                        && temporal_bucket_by_part(hit.chunk.part_index) == 2
+                    {
+                        bonus += 0.05;
+                    }
+                    add_or_insert_result(&mut merged, hit.chunk.clone(), bonus);
+                }
+
+                for (idx, hit) in spine.into_iter().enumerate() {
+                    let mut bonus = 0.24 + 0.01 * (idx as f32);
+                    if is_later_query(question)
+                        && temporal_bucket_by_part(hit.chunk.part_index) == 2
+                    {
+                        bonus += 0.08;
+                    }
+                    add_or_insert_result(&mut merged, hit.chunk, bonus);
                 }
             }
         }
@@ -482,15 +482,68 @@ impl ChatService {
         for (index, item) in selected.into_iter().enumerate() {
             let source_id = format!("S{}", index + 1);
             let rowid = rowid_map.get(&item.chunk.id).copied();
-            let part = rowid.and_then(|id| infer_part_from_rowid(id, &part_markers));
+            let part = item
+                .chunk
+                .part
+                .clone()
+                .or_else(|| rowid.and_then(|id| infer_part_from_rowid(id, &part_markers)));
+            let part_index = item
+                .chunk
+                .part_index
+                .or_else(|| part.as_deref().and_then(part_index_from_label));
             out.push(ContextSource {
                 source_id,
+                part_index,
                 result: item,
                 part,
                 rowid,
             });
         }
 
+        Ok(out)
+    }
+
+    async fn collect_timeline_candidates(
+        &self,
+        anchor_terms: &[String],
+        slice: i64,
+    ) -> Result<Vec<(i64, crate::models::Chunk)>> {
+        if anchor_terms.is_empty() || slice <= 0 {
+            return Ok(vec![]);
+        }
+
+        let total = self.db.count_chunks_by_terms(anchor_terms).await?;
+        let asc = self
+            .db
+            .search_chunks_by_terms_chrono(anchor_terms, slice)
+            .await?;
+        let desc = self
+            .db
+            .search_chunks_by_terms_chrono_desc(anchor_terms, slice)
+            .await?;
+        let middle = if total > slice {
+            let offset = (total / 2).saturating_sub(slice / 2).max(0);
+            self.db
+                .search_chunks_by_terms_chrono_offset(anchor_terms, slice, offset)
+                .await?
+        } else {
+            vec![]
+        };
+
+        let mut merged: HashMap<String, (i64, crate::models::Chunk)> = HashMap::new();
+        for (rowid, chunk) in asc.into_iter().chain(desc).chain(middle) {
+            merged
+                .entry(chunk.id.clone())
+                .and_modify(|existing| {
+                    if rowid < existing.0 {
+                        *existing = (rowid, chunk.clone());
+                    }
+                })
+                .or_insert((rowid, chunk));
+        }
+
+        let mut out: Vec<(i64, crate::models::Chunk)> = merged.into_values().collect();
+        out.sort_by_key(|(rowid, _)| *rowid);
         Ok(out)
     }
 }
@@ -753,6 +806,24 @@ fn normalize_part_marker(raw: &str) -> Option<String> {
     Some(format!("Part {suffix}"))
 }
 
+fn part_index_from_label(label: &str) -> Option<i64> {
+    let normalized = normalize_part_marker(label)?;
+    let re = Regex::new(r"(?i)^part\s+([0-9]+)\s*([ab])?$")
+        .unwrap_or_else(|_| Regex::new("^$").unwrap());
+    let caps = re.captures(&normalized)?;
+    let number = caps.get(1)?.as_str().parse::<i64>().ok()?;
+    let suffix = caps
+        .get(2)
+        .map(|m| m.as_str().to_ascii_uppercase())
+        .unwrap_or_default();
+    let suffix_offset = match suffix.as_str() {
+        "A" => 1,
+        "B" => 2,
+        _ => 0,
+    };
+    Some(number * 10 + suffix_offset)
+}
+
 fn select_timeline_chunks(
     timeline: &[(i64, crate::models::Chunk)],
     max_take: usize,
@@ -783,6 +854,177 @@ fn select_timeline_chunks(
         }
     }
     selected
+}
+
+fn add_or_insert_result(
+    merged: &mut HashMap<String, RetrievalResult>,
+    chunk: crate::models::Chunk,
+    bonus: f32,
+) {
+    if let Some(existing) = merged.get_mut(&chunk.id) {
+        existing.score += bonus;
+    } else {
+        merged.insert(
+            chunk.id.clone(),
+            RetrievalResult {
+                chunk,
+                score: bonus,
+            },
+        );
+    }
+}
+
+fn summary_focus_entity(
+    question: &str,
+    strong_anchors: &[String],
+    anchors: &[String],
+) -> Option<String> {
+    if !(is_overview_query(question) || is_later_query(question) || is_part_query(question)) {
+        return None;
+    }
+
+    if let Some(entity) = strong_anchors.first() {
+        return Some(entity.clone());
+    }
+
+    anchors
+        .iter()
+        .find(|term| term.len() >= 6 && !is_generic_conjunctive_term(term))
+        .cloned()
+}
+
+fn select_entity_summary_spine(
+    hits: &[crate::db::EntityHit],
+    later_bias: bool,
+    max_take: usize,
+) -> Vec<crate::db::EntityHit> {
+    if hits.is_empty() || max_take == 0 {
+        return vec![];
+    }
+
+    let mut by_row = hits.to_vec();
+    by_row.sort_by_key(|h| h.rowid);
+
+    let mut selected = Vec::new();
+    let mut seen = HashSet::new();
+
+    let pick = |selected: &mut Vec<crate::db::EntityHit>,
+                seen: &mut HashSet<String>,
+                hit: &crate::db::EntityHit| {
+        if seen.insert(hit.chunk.id.clone()) {
+            selected.push(hit.clone());
+        }
+    };
+
+    if let Some(first) = by_row.first() {
+        pick(&mut selected, &mut seen, first);
+    }
+    if let Some(mid) = by_row.get(by_row.len() / 2) {
+        pick(&mut selected, &mut seen, mid);
+    }
+    if let Some(last) = by_row.last() {
+        pick(&mut selected, &mut seen, last);
+    }
+
+    let mut per_part: HashMap<i64, crate::db::EntityHit> = HashMap::new();
+    for hit in hits {
+        let Some(part_index) = hit.chunk.part_index else {
+            continue;
+        };
+        let entry = per_part.entry(part_index).or_insert_with(|| hit.clone());
+        if hit.mention_count > entry.mention_count
+            || (hit.mention_count == entry.mention_count && hit.rowid > entry.rowid)
+        {
+            *entry = hit.clone();
+        }
+    }
+
+    let mut part_hits: Vec<crate::db::EntityHit> = per_part.into_values().collect();
+    part_hits.sort_by_key(|h| h.chunk.part_index.unwrap_or_default());
+    for hit in part_hits {
+        if selected.len() >= max_take {
+            break;
+        }
+        pick(&mut selected, &mut seen, &hit);
+    }
+
+    if later_bias {
+        for hit in by_row.iter().rev().take(max_take) {
+            if selected.len() >= max_take {
+                break;
+            }
+            pick(&mut selected, &mut seen, hit);
+        }
+    }
+
+    selected.sort_by_key(|h| h.rowid);
+    selected.truncate(max_take);
+    selected
+}
+
+fn temporal_bucket_by_part(part_index: Option<i64>) -> usize {
+    let Some(index) = part_index else {
+        return 1;
+    };
+    if index < 30 {
+        0
+    } else if index < 60 {
+        1
+    } else {
+        2
+    }
+}
+
+fn is_broad_retrieval_query(question: &str) -> bool {
+    is_overview_query(question) || is_later_query(question) || is_part_query(question)
+}
+
+fn rerank_candidates(question: &str, retrieved: Vec<RetrievalResult>) -> Vec<RetrievalResult> {
+    if retrieved.is_empty() {
+        return retrieved;
+    }
+
+    let question_terms = normalized_question_terms(question);
+    let entity = extract_primary_entity(question);
+    let later_query = is_later_query(question);
+    let overview_query = is_overview_query(question);
+
+    let mut reranked = retrieved;
+    for item in &mut reranked {
+        let overlap = lexical_overlap_score(&item.chunk.content, &question_terms);
+        item.score += overlap * 1.5;
+
+        if let Some(entity_name) = &entity {
+            if item
+                .chunk
+                .content
+                .to_ascii_lowercase()
+                .contains(entity_name.as_str())
+            {
+                item.score += 0.12;
+            }
+        }
+
+        if later_query {
+            match temporal_bucket_by_part(item.chunk.part_index) {
+                2 => item.score += 0.16,
+                0 => item.score -= 0.05,
+                _ => {}
+            }
+        } else if overview_query {
+            match temporal_bucket_by_part(item.chunk.part_index) {
+                0 | 2 => item.score += 0.03,
+                _ => {}
+            }
+        }
+    }
+
+    reranked.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    reranked
 }
 
 fn extract_anchor_terms(question: &str) -> Vec<String> {
@@ -1311,6 +1553,42 @@ fn rebalance_context_sources(
     let mut bucket_counts = [0usize; 3];
     let mut seen = HashSet::new();
     let mut total_tokens = 0usize;
+    let overview_query = is_overview_query(question);
+
+    if overview_query {
+        let mut best_by_part: HashMap<i64, ContextSource> = HashMap::new();
+        for src in &ranked {
+            let Some(part_index) = src.part_index else {
+                continue;
+            };
+            let entry = best_by_part
+                .entry(part_index)
+                .or_insert_with(|| src.clone());
+            if src.result.score > entry.result.score {
+                *entry = src.clone();
+            }
+        }
+
+        let mut part_sources: Vec<ContextSource> = best_by_part.into_values().collect();
+        part_sources.sort_by_key(|s| s.part_index.unwrap_or_default());
+
+        for src in part_sources {
+            if selected.len() >= max_chunks {
+                break;
+            }
+            if seen.contains(&src.result.chunk.id) {
+                continue;
+            }
+            let chunk_tokens = src.result.chunk.token_count.max(0) as usize;
+            if chunk_tokens > max_tokens || total_tokens + chunk_tokens > max_tokens {
+                continue;
+            }
+            total_tokens += chunk_tokens;
+            seen.insert(src.result.chunk.id.clone());
+            bucket_counts[temporal_bucket(src.rowid, min_rowid, max_rowid)] += 1;
+            selected.push(src);
+        }
+    }
 
     for src in &ranked {
         if selected.len() >= max_chunks {
@@ -1414,7 +1692,7 @@ fn build_context(sources: &[ContextSource]) -> (String, Vec<String>) {
 
     for source in sources {
         context.push_str(&format!(
-            "[{}] chunk_id={} kind={} chapter={} part={} page={} rowid={}\n{}\n\n",
+            "[{}] chunk_id={} kind={} chapter={} part={} part_index={} page={} rowid={}\n{}\n\n",
             source.source_id,
             source.result.chunk.id,
             source.result.chunk.kind.as_str(),
@@ -1425,6 +1703,10 @@ fn build_context(sources: &[ContextSource]) -> (String, Vec<String>) {
                 .clone()
                 .unwrap_or_else(|| "-".to_string()),
             source.part.clone().unwrap_or_else(|| "-".to_string()),
+            source
+                .part_index
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "-".to_string()),
             source
                 .result
                 .chunk
@@ -1448,6 +1730,7 @@ fn build_answer_prompt(
     context: &str,
     history: &[(String, String)],
     strict: bool,
+    verbose: bool,
     source_ids: &[String],
     max_tokens: usize,
 ) -> String {
@@ -1480,8 +1763,14 @@ fn build_answer_prompt(
         )
     };
 
+    let style_rules = if verbose {
+        "Write a detailed markdown answer. For character/overview questions, include: (1) early arc, (2) middle arc, (3) latest arc, and (4) current status/implications. Keep claims grounded to cited evidence only."
+    } else {
+        "Write a concise markdown answer focused on direct evidence."
+    };
+
     format!(
-        "You are a local novel QA assistant.\n{strict_rules}\n\nConversation:\n{history_text}\n\nContext:\n{context}\n\nQuestion:\n{question}\n\nWrite a concise markdown answer. Max output tokens: {max_tokens}."
+        "You are a local novel QA assistant.\n{strict_rules}\n\nConversation:\n{history_text}\n\nContext:\n{context}\n\nQuestion:\n{question}\n\n{style_rules}\nMax output tokens: {max_tokens}."
     )
 }
 
@@ -1632,6 +1921,8 @@ mod tests {
                 content: "Evidence sentence from the novel.".to_string(),
                 kind: SourceType::DocxText,
                 chapter: Some("Chapter 2".to_string()),
+                part: Some("Part 2".to_string()),
+                part_index: Some(20),
                 page: None,
                 token_count: 6,
                 source_hash: "abc".to_string(),
@@ -1644,6 +1935,7 @@ mod tests {
             source_id: "S1".to_string(),
             result: retrieved[0].clone(),
             part: Some("Part 2".to_string()),
+            part_index: Some(20),
             rowid: Some(20),
         }];
         let citations = build_citations(&mapped, "Answer with evidence [S1].", true);
@@ -1669,6 +1961,8 @@ mod tests {
                     .to_string(),
                 kind: SourceType::DocxText,
                 chapter: Some("Part 1".to_string()),
+                part: Some("Part 1".to_string()),
+                part_index: Some(10),
                 page: None,
                 token_count: 14,
                 source_hash: "h".to_string(),
@@ -1680,6 +1974,7 @@ mod tests {
             source_id: "S1".to_string(),
             result: retrieved,
             part: Some("Part 1".to_string()),
+            part_index: Some(10),
             rowid: Some(5),
         }];
 
@@ -1716,6 +2011,8 @@ mod tests {
                         .to_string(),
                     kind: SourceType::DocxText,
                     chapter: None,
+                    part: Some("Part 7A".to_string()),
+                    part_index: Some(71),
                     page: None,
                     token_count: 14,
                     source_hash: "h".to_string(),
@@ -1724,6 +2021,7 @@ mod tests {
                 score: 0.7,
             },
             part: Some("Part 7A".to_string()),
+            part_index: Some(71),
             rowid: Some(140),
         };
 
@@ -1746,6 +2044,8 @@ mod tests {
                     content: format!("TheLongIslander event {id}"),
                     kind: SourceType::DocxText,
                     chapter: None,
+                    part: None,
+                    part_index: None,
                     page: None,
                     token_count: 30,
                     source_hash: "h".to_string(),
@@ -1754,6 +2054,7 @@ mod tests {
                 score,
             },
             part: None,
+            part_index: None,
             rowid: Some(rowid),
         };
 
@@ -1784,6 +2085,8 @@ mod tests {
                     content: format!("Arc event {id}"),
                     kind: SourceType::DocxText,
                     chapter: None,
+                    part: None,
+                    part_index: None,
                     page: None,
                     token_count: 28,
                     source_hash: "h".to_string(),
@@ -1792,6 +2095,7 @@ mod tests {
                 score,
             },
             part: None,
+            part_index: None,
             rowid: Some(rowid),
         };
 

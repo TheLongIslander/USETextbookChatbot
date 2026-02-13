@@ -6,6 +6,7 @@ use anyhow::{Context, Result};
 use roxmltree::Document;
 use zip::ZipArchive;
 
+use super::detect_part_marker;
 use crate::models::{SourceType, SourceUnit};
 
 pub fn extract_docx_units(path: &Path, source_hash: &str) -> Result<Vec<SourceUnit>> {
@@ -23,6 +24,8 @@ pub fn extract_docx_units(path: &Path, source_hash: &str) -> Result<Vec<SourceUn
     let doc = Document::parse(&document_xml).context("failed to parse DOCX XML")?;
 
     let mut current_chapter: Option<String> = None;
+    let mut current_part: Option<String> = None;
+    let mut current_part_index: Option<i64> = None;
     let mut units = Vec::new();
 
     for paragraph in doc
@@ -56,12 +59,26 @@ pub fn extract_docx_units(path: &Path, source_hash: &str) -> Result<Vec<SourceUn
             .unwrap_or(false)
         {
             current_chapter = Some(normalized);
+            if let Some((part, part_index)) =
+                current_chapter.as_deref().and_then(detect_part_marker)
+            {
+                current_part = Some(part);
+                current_part_index = Some(part_index);
+            }
+            continue;
+        }
+
+        if let Some((part, part_index)) = detect_part_marker(&normalized) {
+            current_part = Some(part);
+            current_part_index = Some(part_index);
             continue;
         }
 
         units.push(SourceUnit {
             kind: SourceType::DocxText,
             chapter: current_chapter.clone(),
+            part: current_part.clone(),
+            part_index: current_part_index,
             page: None,
             content: normalized,
             source_hash: source_hash.to_string(),

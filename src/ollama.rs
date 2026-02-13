@@ -18,6 +18,46 @@ impl OllamaClient {
     }
 
     pub async fn embed(&self, model: &str, text: &str) -> Result<Vec<f32>> {
+        let input = text.trim();
+        if input.is_empty() {
+            anyhow::bail!("cannot embed empty text input");
+        }
+
+        match self.embed_with_endpoint_fallback(model, input).await {
+            Ok(vector) => Ok(vector),
+            Err(err) => {
+                if !is_context_length_error(&err) {
+                    return Err(err);
+                }
+
+                let word_count = input.split_whitespace().count();
+                let mut last_err = err;
+                for max_words in [1400usize, 1000, 800, 600, 450, 320, 240, 180, 120] {
+                    if word_count <= max_words {
+                        continue;
+                    }
+
+                    let truncated = truncate_to_word_limit(input, max_words);
+                    match self.embed_with_endpoint_fallback(model, &truncated).await {
+                        Ok(vector) => return Ok(vector),
+                        Err(next_err) => {
+                            if !is_context_length_error(&next_err) {
+                                return Err(next_err);
+                            }
+                            last_err = next_err;
+                        }
+                    }
+                }
+
+                Err(anyhow::anyhow!(
+                    "ollama embedding exceeded context length even after adaptive truncation \
+                     (original_words={word_count}). last error: {last_err}"
+                ))
+            }
+        }
+    }
+
+    async fn embed_with_endpoint_fallback(&self, model: &str, text: &str) -> Result<Vec<f32>> {
         // Newer Ollama releases use /api/embed, while older versions use /api/embeddings.
         // Try the new route first and fall back to the legacy route for compatibility.
         match self.embed_modern(model, text).await {
@@ -26,8 +66,8 @@ impl OllamaClient {
                 Ok(vector) => Ok(vector),
                 Err(legacy_err) => Err(anyhow::anyhow!(
                     "ollama embedding failed via /api/embed and /api/embeddings. \
-                         modern error: {modern_err}; legacy error: {legacy_err}; \
-                         ensure the embedding model is pulled (e.g. `ollama pull {model}`)"
+                     modern error: {modern_err}; legacy error: {legacy_err}; \
+                     ensure the embedding model is pulled (e.g. `ollama pull {model}`)"
                 )),
             },
         }
@@ -236,4 +276,17 @@ fn normalize_err_body(body: &str) -> String {
     }
 
     trimmed.to_string()
+}
+
+fn is_context_length_error(err: &anyhow::Error) -> bool {
+    let msg = err.to_string().to_ascii_lowercase();
+    msg.contains("input length exceeds the context length")
+        || (msg.contains("context length") && msg.contains("input length"))
+}
+
+fn truncate_to_word_limit(text: &str, max_words: usize) -> String {
+    text.split_whitespace()
+        .take(max_words)
+        .collect::<Vec<_>>()
+        .join(" ")
 }

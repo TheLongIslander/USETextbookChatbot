@@ -42,8 +42,13 @@
             <input type="checkbox" id="strict" checked />
             Strict citations only
           </label>
+          <label class="checkbox-row">
+            <input type="checkbox" id="verbose" checked />
+            Verbose answers
+          </label>
           <button type="submit">Ask</button>
         </form>
+        <pre id="response-meta" class="status-box">No responses yet.</pre>
         <div>
           <h3>Last Citations</h3>
           <ul id="citation-list"></ul>
@@ -60,6 +65,7 @@
       const chatForm = document.getElementById("chat-form");
       const chatLog = document.getElementById("chat-log");
       const citationList = document.getElementById("citation-list");
+      const responseMeta = document.getElementById("response-meta");
 
       function appendChat(role, text) {
         const wrapper = document.createElement("div");
@@ -83,6 +89,24 @@
           li.textContent = `[${c.chunk_id}] ${c.source_type}${chapter}${page} score=${c.score.toFixed(3)} | ${c.snippet}`;
           citationList.appendChild(li);
         }
+      }
+
+      function renderResponseMeta(data) {
+        if (!data) {
+          responseMeta.textContent = "No responses yet.";
+          return;
+        }
+
+        responseMeta.textContent = JSON.stringify(
+          {
+            mode: data.mode,
+            confidence: data.confidence,
+            latency_ms: data.latency_ms,
+            citation_count: Array.isArray(data.citations) ? data.citations.length : 0,
+          },
+          null,
+          2
+        );
       }
 
       async function pollIngestStatus() {
@@ -145,6 +169,7 @@
           session_id: sessionId,
           question,
           strict: document.getElementById("strict").checked,
+          verbose: document.getElementById("verbose").checked,
         };
 
         const response = await fetch("/api/chat", {
@@ -161,6 +186,7 @@
 
         appendChat("assistant", data.answer_markdown);
         renderCitations(data.citations || []);
+        renderResponseMeta(data);
         document.getElementById("question").value = "";
       });
     </script>

@@ -5,11 +5,12 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 use chrono::Utc;
+use regex::Regex;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::config::AppConfig;
-use crate::db::Database;
+use crate::db::{Database, EntityMention};
 use crate::models::{Chunk, IngestManifest, IngestRequest, IngestStatus, SourceType, SourceUnit};
 use crate::ollama::OllamaClient;
 use crate::qdrant_store::{QdrantPayload, QdrantPoint, QdrantStore};
@@ -172,6 +173,8 @@ impl Ingestor {
                     id: None,
                     kind: chunk.kind.as_str().to_string(),
                     chapter: chunk.chapter.clone(),
+                    part: chunk.part.clone(),
+                    part_index: chunk.part_index,
                     page: chunk.page,
                 },
             });
@@ -198,6 +201,9 @@ impl Ingestor {
         self.db.insert_chunks(&chunks).await?;
         self.db.clear_image_assets().await?;
         self.db.insert_image_assets(&image_assets).await?;
+        self.db.clear_entity_mentions().await?;
+        let mentions = build_entity_mentions(&chunks);
+        self.db.insert_entity_mentions(&mentions).await?;
 
         let manifest = IngestManifest {
             docx_hash,
@@ -227,12 +233,27 @@ impl Ingestor {
 
 fn build_chunks(units: Vec<SourceUnit>, target_tokens: usize, overlap_tokens: usize) -> Vec<Chunk> {
     let mut chunks = Vec::new();
-    let step = target_tokens.saturating_sub(overlap_tokens).max(1);
 
-    for unit in units {
+    let mut current_part: Option<String> = None;
+    let mut current_part_index: Option<i64> = None;
+
+    for mut unit in units {
         let normalized = normalize_text(&unit.content);
         if normalized.is_empty() {
             continue;
+        }
+
+        let inline_part = detect_part_marker(&normalized);
+        if let Some((part, part_index)) = inline_part.clone() {
+            current_part = Some(part);
+            current_part_index = Some(part_index);
+        }
+        if unit.part.is_none() {
+            unit.part = current_part.clone();
+            unit.part_index = current_part_index;
+        } else if let Some(part) = unit.part.clone() {
+            current_part = Some(part);
+            current_part_index = unit.part_index;
         }
 
         let tokens: Vec<String> = normalized
@@ -240,13 +261,29 @@ fn build_chunks(units: Vec<SourceUnit>, target_tokens: usize, overlap_tokens: us
             .map(|token| token.to_string())
             .collect();
 
-        let is_image_unit = matches!(unit.kind, SourceType::ImageCaption | SourceType::ImageOcr);
-        if is_image_unit || tokens.len() <= target_tokens {
+        let unit_target_tokens =
+            if matches!(unit.kind, SourceType::ImageCaption | SourceType::ImageOcr) {
+                target_tokens.min(220)
+            } else {
+                target_tokens
+            };
+        let unit_overlap_tokens = overlap_tokens.min(unit_target_tokens.saturating_sub(1));
+        let unit_step = unit_target_tokens
+            .saturating_sub(unit_overlap_tokens)
+            .max(1);
+
+        if inline_part.is_some() && tokens.len() <= 6 {
+            continue;
+        }
+
+        if tokens.len() <= unit_target_tokens {
             chunks.push(Chunk {
                 id: Uuid::new_v4().to_string(),
                 content: normalized,
                 kind: unit.kind,
                 chapter: unit.chapter,
+                part: unit.part,
+                part_index: unit.part_index,
                 page: unit.page,
                 token_count: tokens.len() as i64,
                 source_hash: unit.source_hash,
@@ -257,7 +294,7 @@ fn build_chunks(units: Vec<SourceUnit>, target_tokens: usize, overlap_tokens: us
 
         let mut start = 0;
         while start < tokens.len() {
-            let end = (start + target_tokens).min(tokens.len());
+            let end = (start + unit_target_tokens).min(tokens.len());
             let content = tokens[start..end].join(" ");
 
             chunks.push(Chunk {
@@ -265,6 +302,8 @@ fn build_chunks(units: Vec<SourceUnit>, target_tokens: usize, overlap_tokens: us
                 content,
                 kind: unit.kind,
                 chapter: unit.chapter.clone(),
+                part: unit.part.clone(),
+                part_index: unit.part_index,
                 page: unit.page,
                 token_count: (end - start) as i64,
                 source_hash: unit.source_hash.clone(),
@@ -274,7 +313,7 @@ fn build_chunks(units: Vec<SourceUnit>, target_tokens: usize, overlap_tokens: us
             if end == tokens.len() {
                 break;
             }
-            start += step;
+            start += unit_step;
         }
     }
 
@@ -288,6 +327,70 @@ fn normalize_text(text: &str) -> String {
         .join(" ")
         .trim()
         .to_string()
+}
+
+pub(crate) fn detect_part_marker(line: &str) -> Option<(String, i64)> {
+    let cleaned = line.replace('\u{200B}', "").trim().to_string();
+    let re = Regex::new(r"(?i)^\s*part\s*([0-9]{1,2})\s*([ab])?(?:\s*[:\-]\s*.*)?$")
+        .unwrap_or_else(|_| Regex::new("^$").unwrap());
+    let caps = re.captures(&cleaned)?;
+
+    let number = caps.get(1)?.as_str().parse::<i64>().ok()?;
+    let suffix = caps
+        .get(2)
+        .map(|m| m.as_str().to_ascii_uppercase())
+        .unwrap_or_default();
+    let label = format!("Part {number}{suffix}");
+    let suffix_offset = match suffix.as_str() {
+        "A" => 1,
+        "B" => 2,
+        _ => 0,
+    };
+
+    Some((label, number * 10 + suffix_offset))
+}
+
+pub(crate) fn detect_part_marker_anywhere(text: &str) -> Option<(String, i64)> {
+    text.lines().take(12).find_map(detect_part_marker)
+}
+
+fn build_entity_mentions(chunks: &[Chunk]) -> Vec<EntityMention> {
+    let token_re = Regex::new(r"[A-Za-z0-9_]+").unwrap_or_else(|_| Regex::new("^$").unwrap());
+    let mut mentions: Vec<EntityMention> = Vec::new();
+
+    for chunk in chunks {
+        let mut per_entity: std::collections::HashMap<String, i64> =
+            std::collections::HashMap::new();
+        for mat in token_re.find_iter(&chunk.content) {
+            let token = mat.as_str();
+            if !is_entity_token(token) {
+                continue;
+            }
+            let normalized = token.to_ascii_lowercase();
+            *per_entity.entry(normalized).or_insert(0) += 1;
+        }
+
+        for (entity, count) in per_entity {
+            mentions.push(EntityMention {
+                entity,
+                chunk_id: chunk.id.clone(),
+                mentions: count,
+                part_index: chunk.part_index,
+            });
+        }
+    }
+
+    mentions
+}
+
+fn is_entity_token(token: &str) -> bool {
+    if token.len() < 4 {
+        return false;
+    }
+    let has_digit = token.chars().any(|c| c.is_ascii_digit());
+    let has_internal_upper = token.chars().skip(1).any(|c| c.is_ascii_uppercase());
+    let has_underscore = token.contains('_');
+    has_digit || has_internal_upper || has_underscore
 }
 
 async fn file_sha256(path: &str) -> Result<String> {
@@ -313,6 +416,8 @@ mod tests {
         let units = vec![SourceUnit {
             kind: SourceType::DocxText,
             chapter: Some("Chapter 1".to_string()),
+            part: Some("Part 1".to_string()),
+            part_index: Some(10),
             page: None,
             content,
             source_hash: "h".to_string(),
@@ -322,6 +427,7 @@ mod tests {
         let chunks = build_chunks(units, 50, 10);
         assert!(chunks.len() >= 3);
         assert_eq!(chunks[0].chapter.as_deref(), Some("Chapter 1"));
+        assert_eq!(chunks[0].part_index, Some(10));
         assert!(chunks.iter().all(|c| c.token_count > 0));
     }
 
@@ -330,6 +436,8 @@ mod tests {
         let units = vec![SourceUnit {
             kind: SourceType::ImageCaption,
             chapter: None,
+            part: None,
+            part_index: None,
             page: Some(3),
             content: "A single image caption chunk".to_string(),
             source_hash: "h".to_string(),
@@ -340,5 +448,32 @@ mod tests {
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0].kind, SourceType::ImageCaption);
         assert_eq!(chunks[0].page, Some(3));
+    }
+
+    #[test]
+    fn detects_part_labels() {
+        let part = detect_part_marker("Part 7a: Return Arc").expect("part");
+        assert_eq!(part.0, "Part 7A");
+        assert_eq!(part.1, 71);
+    }
+
+    #[test]
+    fn builds_entity_mentions_for_named_tokens() {
+        let chunks = vec![Chunk {
+            id: "c1".to_string(),
+            content: "TheLongIslander met AggravatedCow and Apollo345".to_string(),
+            kind: SourceType::DocxText,
+            chapter: None,
+            part: Some("Part 1".to_string()),
+            part_index: Some(10),
+            page: None,
+            token_count: 7,
+            source_hash: "h".to_string(),
+            image_path: None,
+        }];
+
+        let mentions = build_entity_mentions(&chunks);
+        assert!(mentions.iter().any(|m| m.entity == "thelongislander"));
+        assert!(mentions.iter().any(|m| m.entity == "apollo345"));
     }
 }

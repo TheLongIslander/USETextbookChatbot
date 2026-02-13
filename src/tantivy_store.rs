@@ -19,6 +19,7 @@ struct TantivyFields {
     content: Field,
     kind: Field,
     chapter: Field,
+    part: Field,
     page: Field,
 }
 
@@ -43,6 +44,7 @@ impl TantivyStore {
                 fields.content => chunk.content.clone(),
                 fields.kind => chunk.kind.as_str().to_string(),
                 fields.chapter => chunk.chapter.clone().unwrap_or_default(),
+                fields.part => chunk.part.clone().unwrap_or_default(),
                 fields.page => chunk.page.unwrap_or_default(),
             ))?;
         }
@@ -62,7 +64,8 @@ impl TantivyStore {
         let reader = index.reader()?;
         let searcher = reader.searcher();
 
-        let query_parser = QueryParser::for_index(&index, vec![fields.content, fields.chapter]);
+        let query_parser =
+            QueryParser::for_index(&index, vec![fields.content, fields.chapter, fields.part]);
         let query = query_parser.parse_query(query)?;
         let top_docs = searcher.search(&query, &TopDocs::with_limit(limit))?;
 
@@ -88,6 +91,7 @@ fn build_schema() -> (Schema, TantivyFields) {
     let content = builder.add_text_field("content", TEXT | STORED);
     let kind = builder.add_text_field("kind", STRING | STORED);
     let chapter = builder.add_text_field("chapter", TEXT | STORED);
+    let part = builder.add_text_field("part", TEXT | STORED);
     let page = builder.add_i64_field("page", STORED);
 
     (
@@ -97,6 +101,7 @@ fn build_schema() -> (Schema, TantivyFields) {
             content,
             kind,
             chapter,
+            part,
             page,
         },
     )
@@ -115,6 +120,9 @@ fn resolve_fields(schema: &Schema) -> Result<TantivyFields> {
             .map_err(|err| anyhow::anyhow!(err.to_string()))?,
         chapter: schema
             .get_field("chapter")
+            .map_err(|err| anyhow::anyhow!(err.to_string()))?,
+        part: schema
+            .get_field("part")
             .map_err(|err| anyhow::anyhow!(err.to_string()))?,
         page: schema
             .get_field("page")

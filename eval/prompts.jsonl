@@ -1,0 +1,5 @@
+{"id":"who_tli_overview","question":"Who is TheLongIslander? Give an overall arc summary, including later parts.","strict":true,"expect_contains":["thelongislander"],"expect_late_part":true}
+{"id":"apollo_death","question":"When did Apollo345 die?","strict":true,"expect_contains":["apollo345"]}
+{"id":"agc_cuba_part","question":"When did AggravatedCow go to Cuba? Which part of the book?","strict":true,"expect_contains":["cuba","part"],"expect_late_part":true}
+{"id":"later_followup","question":"What does he do later in the novel?","strict":true,"expect_late_part":true}
+{"id":"unknown_fact","question":"What is the exact model number of the moon shuttle?","strict":true,"expect_not_found":true}

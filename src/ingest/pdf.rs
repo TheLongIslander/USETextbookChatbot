@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -6,6 +7,7 @@ use tokio::process::Command;
 use uuid::Uuid;
 use walkdir::WalkDir;
 
+use super::detect_part_marker_anywhere;
 use crate::models::{ImageAsset, SourceType, SourceUnit};
 use crate::ollama::OllamaClient;
 
@@ -17,9 +19,17 @@ pub async fn extract_pdf_units(
     vision_model: &str,
 ) -> Result<(Vec<SourceUnit>, Vec<ImageAsset>)> {
     let mut units = extract_pdf_text_units(pdf_path, source_hash).await?;
+    let page_part_map = build_page_part_map(&units);
 
-    let (image_units, image_assets) =
-        extract_image_units(pdf_path, source_hash, image_dir, ollama, vision_model).await?;
+    let (image_units, image_assets) = extract_image_units(
+        pdf_path,
+        source_hash,
+        image_dir,
+        ollama,
+        vision_model,
+        &page_part_map,
+    )
+    .await?;
 
     units.extend(image_units);
     Ok((units, image_assets))
@@ -27,6 +37,8 @@ pub async fn extract_pdf_units(
 
 async fn extract_pdf_text_units(pdf_path: &Path, source_hash: &str) -> Result<Vec<SourceUnit>> {
     let mut units = Vec::new();
+    let mut current_part: Option<String> = None;
+    let mut current_part_index: Option<i64> = None;
 
     if has_command("pdftotext").await {
         let page_count = get_pdf_page_count(pdf_path).await.unwrap_or(0);
@@ -54,9 +66,16 @@ async fn extract_pdf_text_units(pdf_path: &Path, source_hash: &str) -> Result<Ve
                     continue;
                 }
 
+                if let Some((part, part_index)) = detect_part_marker_anywhere(&content) {
+                    current_part = Some(part);
+                    current_part_index = Some(part_index);
+                }
+
                 units.push(SourceUnit {
                     kind: SourceType::PdfText,
                     chapter: None,
+                    part: current_part.clone(),
+                    part_index: current_part_index,
                     page: Some(page as i64),
                     content,
                     source_hash: source_hash.to_string(),
@@ -75,9 +94,13 @@ async fn extract_pdf_text_units(pdf_path: &Path, source_hash: &str) -> Result<Ve
 
         let content = normalize_text(&extracted);
         if !content.is_empty() {
+            let (part, part_index) = detect_part_marker_anywhere(&content)
+                .map_or((None, None), |(p, idx)| (Some(p), Some(idx)));
             units.push(SourceUnit {
                 kind: SourceType::PdfText,
                 chapter: None,
+                part,
+                part_index,
                 page: None,
                 content,
                 source_hash: source_hash.to_string(),
@@ -95,6 +118,7 @@ async fn extract_image_units(
     image_dir: &Path,
     ollama: &OllamaClient,
     vision_model: &str,
+    page_part_map: &HashMap<i64, (Option<String>, Option<i64>)>,
 ) -> Result<(Vec<SourceUnit>, Vec<ImageAsset>)> {
     if !has_command("pdfimages").await {
         return Ok((vec![], vec![]));
@@ -145,6 +169,9 @@ async fn extract_image_units(
 
     for (index, file_path) in files.iter().enumerate() {
         let page = page_mapping.get(index).copied();
+        let (part, part_index) = page
+            .and_then(|p| page_part_map.get(&p).cloned())
+            .unwrap_or((None, None));
         let ocr_text = extract_ocr_text(file_path).await.unwrap_or_default();
 
         let image_bytes = tokio::fs::read(file_path).await.unwrap_or_default();
@@ -173,6 +200,8 @@ async fn extract_image_units(
             units.push(SourceUnit {
                 kind: SourceType::ImageCaption,
                 chapter: None,
+                part: part.clone(),
+                part_index,
                 page,
                 content: normalize_text(&caption),
                 source_hash: source_hash.to_string(),
@@ -184,6 +213,8 @@ async fn extract_image_units(
             units.push(SourceUnit {
                 kind: SourceType::ImageOcr,
                 chapter: None,
+                part: part.clone(),
+                part_index,
                 page,
                 content: normalize_text(&ocr_text),
                 source_hash: source_hash.to_string(),
@@ -295,4 +326,15 @@ fn normalize_text(input: &str) -> String {
         .join(" ")
         .trim()
         .to_string()
+}
+
+fn build_page_part_map(units: &[SourceUnit]) -> HashMap<i64, (Option<String>, Option<i64>)> {
+    let mut map = HashMap::new();
+    for unit in units {
+        let Some(page) = unit.page else {
+            continue;
+        };
+        map.insert(page, (unit.part.clone(), unit.part_index));
+    }
+    map
 }

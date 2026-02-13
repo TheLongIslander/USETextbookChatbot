@@ -152,6 +152,8 @@ pub struct QdrantPayload {
     pub id: Option<String>,
     pub kind: String,
     pub chapter: Option<String>,
+    pub part: Option<String>,
+    pub part_index: Option<i64>,
     pub page: Option<i64>,
 }
 

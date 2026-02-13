@@ -76,13 +76,15 @@ cargo run --bin ingest -- \
 
 Add `--rebuild` to force re-index even if source hashes are unchanged.
 
+After retrieval/schema upgrades, rerun ingest with `--rebuild` so `part` metadata and entity mention indexes are refreshed.
+
 ## API
 
 - `POST /api/ingest`
   - body: `{ "docx_path": "...", "pdf_path": "...", "rebuild": false }`
 - `GET /api/ingest/:job_id`
 - `POST /api/chat`
-  - body: `{ "session_id": "...", "question": "...", "strict": true }`
+  - body: `{ "session_id": "...", "question": "...", "strict": true, "verbose": true }`
 - `GET /api/sources/:chunk_id`
 - `POST /api/session`
   - create: `{ "reset": false }`
@@ -108,4 +110,18 @@ By default data is written under `./data`:
 ```bash
 cargo check
 cargo test
+```
+
+## Evaluation Harness
+
+Run the built-in local eval set:
+
+```bash
+cargo run --bin eval -- --file eval/prompts.jsonl --strict true
+```
+
+Use `--verbose` to print each response:
+
+```bash
+cargo run --bin eval -- --file eval/prompts.jsonl --verbose
 ```

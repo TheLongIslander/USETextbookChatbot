@@ -37,6 +37,8 @@ pub struct Chunk {
     pub content: String,
     pub kind: SourceType,
     pub chapter: Option<String>,
+    pub part: Option<String>,
+    pub part_index: Option<i64>,
     pub page: Option<i64>,
     pub token_count: i64,
     pub source_hash: String,
@@ -126,6 +128,8 @@ pub struct ChatRequest {
     pub question: String,
     #[serde(default = "default_true")]
     pub strict: bool,
+    #[serde(default = "default_true")]
+    pub verbose: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -153,6 +157,8 @@ pub struct RetrievalResult {
 pub struct SourceUnit {
     pub kind: SourceType,
     pub chapter: Option<String>,
+    pub part: Option<String>,
+    pub part_index: Option<i64>,
     pub page: Option<i64>,
     pub content: String,
     pub source_hash: String,

@@ -15,6 +15,21 @@ pub struct Database {
     pool: SqlitePool,
 }
 
+#[derive(Debug, Clone)]
+pub struct EntityMention {
+    pub entity: String,
+    pub chunk_id: String,
+    pub mentions: i64,
+    pub part_index: Option<i64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct EntityHit {
+    pub rowid: i64,
+    pub mention_count: i64,
+    pub chunk: Chunk,
+}
+
 impl Database {
     pub async fn new(config: &AppConfig) -> Result<Self> {
         tokio::fs::create_dir_all(&config.data_dir).await?;
@@ -41,6 +56,8 @@ impl Database {
                 content TEXT NOT NULL,
                 kind TEXT NOT NULL,
                 chapter TEXT,
+                part TEXT,
+                part_index INTEGER,
                 page INTEGER,
                 token_count INTEGER NOT NULL,
                 source_hash TEXT NOT NULL,
@@ -88,7 +105,33 @@ impl Database {
                 started_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS entity_mentions (
+                entity TEXT NOT NULL,
+                chunk_id TEXT NOT NULL,
+                mentions INTEGER NOT NULL,
+                part_index INTEGER,
+                PRIMARY KEY (entity, chunk_id),
+                FOREIGN KEY (chunk_id) REFERENCES chunks(id) ON DELETE CASCADE
+            );
             "#,
+        )
+        .execute(&self.pool)
+        .await?;
+
+        ensure_column(&self.pool, "chunks", "part", "TEXT").await?;
+        ensure_column(&self.pool, "chunks", "part_index", "INTEGER").await?;
+
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_chunks_part_index ON chunks(part_index)")
+            .execute(&self.pool)
+            .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_entity_mentions_entity_part ON entity_mentions(entity, part_index)",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_entity_mentions_chunk ON entity_mentions(chunk_id)",
         )
         .execute(&self.pool)
         .await?;
@@ -115,7 +158,7 @@ impl Database {
     pub async fn get_chunk(&self, chunk_id: &str) -> Result<Option<Chunk>> {
         let row = sqlx::query(
             r#"
-            SELECT id, content, kind, chapter, page, token_count, source_hash, image_path
+            SELECT id, content, kind, chapter, part, part_index, page, token_count, source_hash, image_path
             FROM chunks
             WHERE id = ?
             "#,
@@ -133,7 +176,7 @@ impl Database {
         }
 
         let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new(
-            "SELECT id, content, kind, chapter, page, token_count, source_hash, image_path FROM chunks WHERE id IN (",
+            "SELECT id, content, kind, chapter, part, part_index, page, token_count, source_hash, image_path FROM chunks WHERE id IN (",
         );
         let mut separated = qb.separated(",");
         for id in ids {
@@ -159,7 +202,7 @@ impl Database {
         }
 
         let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new(
-            "SELECT id, content, kind, chapter, page, token_count, source_hash, image_path FROM chunks WHERE ",
+            "SELECT id, content, kind, chapter, part, part_index, page, token_count, source_hash, image_path FROM chunks WHERE ",
         );
 
         for (idx, term) in terms.iter().enumerate() {
@@ -187,7 +230,7 @@ impl Database {
         }
 
         let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new(
-            "SELECT id, content, kind, chapter, page, token_count, source_hash, image_path FROM chunks WHERE ",
+            "SELECT id, content, kind, chapter, part, part_index, page, token_count, source_hash, image_path FROM chunks WHERE ",
         );
 
         for (idx, term) in terms.iter().enumerate() {
@@ -210,12 +253,62 @@ impl Database {
         terms: &[String],
         limit: i64,
     ) -> Result<Vec<(i64, Chunk)>> {
+        self.search_chunks_by_terms_chrono_ordered(terms, limit, 0, false)
+            .await
+    }
+
+    pub async fn search_chunks_by_terms_chrono_desc(
+        &self,
+        terms: &[String],
+        limit: i64,
+    ) -> Result<Vec<(i64, Chunk)>> {
+        self.search_chunks_by_terms_chrono_ordered(terms, limit, 0, true)
+            .await
+    }
+
+    pub async fn search_chunks_by_terms_chrono_offset(
+        &self,
+        terms: &[String],
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<(i64, Chunk)>> {
+        self.search_chunks_by_terms_chrono_ordered(terms, limit, offset, false)
+            .await
+    }
+
+    pub async fn count_chunks_by_terms(&self, terms: &[String]) -> Result<i64> {
+        if terms.is_empty() {
+            return Ok(0);
+        }
+
+        let mut qb: QueryBuilder<Sqlite> =
+            QueryBuilder::new("SELECT COUNT(*) as count FROM chunks WHERE ");
+
+        for (idx, term) in terms.iter().enumerate() {
+            if idx > 0 {
+                qb.push(" OR ");
+            }
+            qb.push("lower(content) LIKE ");
+            qb.push_bind(format!("%{}%", term.to_ascii_lowercase()));
+        }
+
+        let row = qb.build().fetch_one(&self.pool).await?;
+        Ok(row.get::<i64, _>("count"))
+    }
+
+    async fn search_chunks_by_terms_chrono_ordered(
+        &self,
+        terms: &[String],
+        limit: i64,
+        offset: i64,
+        descending: bool,
+    ) -> Result<Vec<(i64, Chunk)>> {
         if terms.is_empty() || limit <= 0 {
             return Ok(vec![]);
         }
 
         let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new(
-            "SELECT rowid, id, content, kind, chapter, page, token_count, source_hash, image_path FROM chunks WHERE ",
+            "SELECT rowid, id, content, kind, chapter, part, part_index, page, token_count, source_hash, image_path FROM chunks WHERE ",
         );
 
         for (idx, term) in terms.iter().enumerate() {
@@ -226,13 +319,93 @@ impl Database {
             qb.push_bind(format!("%{}%", term.to_ascii_lowercase()));
         }
 
-        qb.push(" ORDER BY rowid ASC LIMIT ");
-        qb.push_bind(limit);
+        if descending {
+            qb.push(" ORDER BY rowid DESC");
+        } else {
+            qb.push(" ORDER BY rowid ASC");
+        }
+        if offset > 0 {
+            qb.push(" LIMIT ");
+            qb.push_bind(limit);
+            qb.push(" OFFSET ");
+            qb.push_bind(offset);
+        } else {
+            qb.push(" LIMIT ");
+            qb.push_bind(limit);
+        }
 
         let rows: Vec<SqliteRow> = qb.build().fetch_all(&self.pool).await?;
         let mut out = Vec::with_capacity(rows.len());
         for row in rows {
             out.push((row.get::<i64, _>("rowid"), row_to_chunk(row)));
+        }
+        Ok(out)
+    }
+
+    pub async fn clear_entity_mentions(&self) -> Result<()> {
+        sqlx::query("DELETE FROM entity_mentions")
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn insert_entity_mentions(&self, mentions: &[EntityMention]) -> Result<()> {
+        if mentions.is_empty() {
+            return Ok(());
+        }
+
+        let mut tx = self.pool.begin().await?;
+        for mention in mentions {
+            sqlx::query(
+                r#"
+                INSERT INTO entity_mentions (entity, chunk_id, mentions, part_index)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(entity, chunk_id) DO UPDATE SET
+                    mentions = excluded.mentions,
+                    part_index = excluded.part_index
+                "#,
+            )
+            .bind(&mention.entity)
+            .bind(&mention.chunk_id)
+            .bind(mention.mentions)
+            .bind(mention.part_index)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn entity_hits(&self, entity: &str, limit: i64) -> Result<Vec<EntityHit>> {
+        if entity.trim().is_empty() || limit <= 0 {
+            return Ok(vec![]);
+        }
+
+        let rows = sqlx::query(
+            r#"
+            SELECT
+                c.rowid as rowid,
+                c.id, c.content, c.kind, c.chapter, c.part, c.part_index, c.page, c.token_count, c.source_hash, c.image_path,
+                em.mentions as mention_count
+            FROM entity_mentions em
+            JOIN chunks c ON c.id = em.chunk_id
+            WHERE em.entity = ?
+            ORDER BY (c.part_index IS NULL) ASC, c.part_index ASC, em.mentions DESC, c.rowid ASC
+            LIMIT ?
+            "#,
+        )
+        .bind(entity.to_ascii_lowercase())
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            out.push(EntityHit {
+                rowid: row.get::<i64, _>("rowid"),
+                mention_count: row.get::<i64, _>("mention_count"),
+                chunk: row_to_chunk(row),
+            });
         }
         Ok(out)
     }
@@ -483,14 +656,16 @@ impl Database {
 async fn insert_chunk_tx(tx: &mut Transaction<'_, Sqlite>, chunk: &Chunk) -> Result<()> {
     sqlx::query(
         r#"
-        INSERT INTO chunks (id, content, kind, chapter, page, token_count, source_hash, image_path)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO chunks (id, content, kind, chapter, part, part_index, page, token_count, source_hash, image_path)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         "#,
     )
     .bind(&chunk.id)
     .bind(&chunk.content)
     .bind(chunk.kind.as_str())
     .bind(&chunk.chapter)
+    .bind(&chunk.part)
+    .bind(chunk.part_index)
     .bind(chunk.page)
     .bind(chunk.token_count)
     .bind(&chunk.source_hash)
@@ -507,9 +682,25 @@ fn row_to_chunk(row: SqliteRow) -> Chunk {
         content: row.get("content"),
         kind: SourceType::from_db(&row.get::<String, _>("kind")),
         chapter: row.get("chapter"),
+        part: row.try_get("part").ok(),
+        part_index: row.try_get("part_index").ok(),
         page: row.get("page"),
         token_count: row.get("token_count"),
         source_hash: row.get("source_hash"),
         image_path: row.get("image_path"),
+    }
+}
+
+async fn ensure_column(
+    pool: &SqlitePool,
+    table: &str,
+    column: &str,
+    column_type: &str,
+) -> Result<()> {
+    let stmt = format!("ALTER TABLE {table} ADD COLUMN {column} {column_type}");
+    match sqlx::query(&stmt).execute(pool).await {
+        Ok(_) => Ok(()),
+        Err(err) if err.to_string().contains("duplicate column name") => Ok(()),
+        Err(err) => Err(err.into()),
     }
 }
