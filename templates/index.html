@@ -1,0 +1,168 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Offline Novel Chatbot</title>
+    <link rel="stylesheet" href="/static/style.css" />
+  </head>
+  <body>
+    <main class="layout">
+      <header>
+        <h1>Offline Novel Chatbot</h1>
+        <p>Strict citation mode with local DOCX + PDF ingestion.</p>
+      </header>
+
+      <section class="card">
+        <h2>Ingest Sources</h2>
+        <form id="ingest-form">
+          <label>
+            DOCX path
+            <input type="text" id="docx-path" placeholder="/path/to/novel.docx" required />
+          </label>
+          <label>
+            PDF path
+            <input type="text" id="pdf-path" placeholder="/path/to/novel.pdf" required />
+          </label>
+          <label class="checkbox-row">
+            <input type="checkbox" id="rebuild" />
+            Force rebuild
+          </label>
+          <button type="submit">Start Ingest</button>
+        </form>
+        <pre id="ingest-status" class="status-box">No ingest job started.</pre>
+      </section>
+
+      <section class="card">
+        <h2>Chat</h2>
+        <div id="chat-log" class="chat-log"></div>
+        <form id="chat-form" class="chat-form">
+          <textarea id="question" rows="4" placeholder="Ask about your novel..." required></textarea>
+          <label class="checkbox-row">
+            <input type="checkbox" id="strict" checked />
+            Strict citations only
+          </label>
+          <button type="submit">Ask</button>
+        </form>
+        <div>
+          <h3>Last Citations</h3>
+          <ul id="citation-list"></ul>
+        </div>
+      </section>
+    </main>
+
+    <script>
+      const sessionId = "{{ session_id }}";
+      let activeIngestJob = null;
+
+      const ingestForm = document.getElementById("ingest-form");
+      const ingestStatus = document.getElementById("ingest-status");
+      const chatForm = document.getElementById("chat-form");
+      const chatLog = document.getElementById("chat-log");
+      const citationList = document.getElementById("citation-list");
+
+      function appendChat(role, text) {
+        const wrapper = document.createElement("div");
+        wrapper.className = `chat-entry ${role}`;
+        wrapper.innerText = `${role.toUpperCase()}: ${text}`;
+        chatLog.appendChild(wrapper);
+        chatLog.scrollTop = chatLog.scrollHeight;
+      }
+
+      function renderCitations(citations) {
+        citationList.innerHTML = "";
+        if (!citations || citations.length === 0) {
+          citationList.innerHTML = "<li>No citations returned.</li>";
+          return;
+        }
+
+        for (const c of citations) {
+          const li = document.createElement("li");
+          const chapter = c.chapter ? ` chapter=${c.chapter}` : "";
+          const page = c.page ? ` page=${c.page}` : "";
+          li.textContent = `[${c.chunk_id}] ${c.source_type}${chapter}${page} score=${c.score.toFixed(3)} | ${c.snippet}`;
+          citationList.appendChild(li);
+        }
+      }
+
+      async function pollIngestStatus() {
+        if (!activeIngestJob) {
+          return;
+        }
+
+        const response = await fetch(`/api/ingest/${activeIngestJob}`);
+        if (!response.ok) {
+          ingestStatus.textContent = `Failed to fetch status: ${response.status}`;
+          return;
+        }
+
+        const status = await response.json();
+        ingestStatus.textContent = JSON.stringify(status, null, 2);
+
+        if (status.status === "completed" || status.status === "failed") {
+          activeIngestJob = null;
+          return;
+        }
+
+        setTimeout(pollIngestStatus, 1500);
+      }
+
+      ingestForm.addEventListener("submit", async (event) => {
+        event.preventDefault();
+        const payload = {
+          docx_path: document.getElementById("docx-path").value,
+          pdf_path: document.getElementById("pdf-path").value,
+          rebuild: document.getElementById("rebuild").checked,
+        };
+
+        const response = await fetch("/api/ingest", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        });
+
+        const data = await response.json();
+        if (!response.ok) {
+          ingestStatus.textContent = JSON.stringify(data, null, 2);
+          return;
+        }
+
+        activeIngestJob = data.job_id;
+        ingestStatus.textContent = `Ingest job started: ${activeIngestJob}`;
+        pollIngestStatus();
+      });
+
+      chatForm.addEventListener("submit", async (event) => {
+        event.preventDefault();
+        const question = document.getElementById("question").value.trim();
+        if (!question) {
+          return;
+        }
+
+        appendChat("user", question);
+
+        const payload = {
+          session_id: sessionId,
+          question,
+          strict: document.getElementById("strict").checked,
+        };
+
+        const response = await fetch("/api/chat", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        });
+
+        const data = await response.json();
+        if (!response.ok) {
+          appendChat("assistant", data.error || "Request failed");
+          return;
+        }
+
+        appendChat("assistant", data.answer_markdown);
+        renderCitations(data.citations || []);
+        document.getElementById("question").value = "";
+      });
+    </script>
+  </body>
+</html>
