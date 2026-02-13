@@ -35,7 +35,7 @@ impl AppConfig {
 
         Self {
             bind_addr: env::var("NOVEL_CHATBOT_BIND")
-                .unwrap_or_else(|_| "127.0.0.1:8080".to_string()),
+                .unwrap_or_else(|_| "127.0.0.1:8089".to_string()),
             data_dir,
             ollama_base_url: env::var("OLLAMA_BASE_URL")
                 .unwrap_or_else(|_| "http://127.0.0.1:11434".to_string()),

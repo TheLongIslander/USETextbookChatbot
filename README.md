@@ -64,7 +64,7 @@ ollama pull llava:7b
 cargo run
 ```
 
-5. Open `http://127.0.0.1:8080`.
+5. Open `http://127.0.0.1:8089`.
 
 ## Ingest from CLI
 

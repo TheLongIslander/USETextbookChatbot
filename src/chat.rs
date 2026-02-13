@@ -1836,7 +1836,7 @@ fn build_citations(sources: &[ContextSource], answer: &str, strict: bool) -> Vec
             return vec![];
         }
 
-        for source in sources.iter().take(3) {
+        for source in sources {
             citations.push(Citation {
                 chunk_id: source.result.chunk.id.clone(),
                 source_type: source.result.chunk.kind,

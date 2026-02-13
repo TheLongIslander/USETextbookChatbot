@@ -3,39 +3,18 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Offline Novel Chatbot</title>
+    <title>USE Textbook Chatbot</title>
     <link rel="stylesheet" href="/static/style.css" />
   </head>
   <body>
     <main class="layout">
       <header>
-        <h1>Offline Novel Chatbot</h1>
-        <p>Strict citation mode with local DOCX + PDF ingestion.</p>
+        <h1>USE Textbook Chatbot</h1>
       </header>
 
       <section class="card">
-        <h2>Ingest Sources</h2>
-        <form id="ingest-form">
-          <label>
-            DOCX path
-            <input type="text" id="docx-path" placeholder="/path/to/novel.docx" required />
-          </label>
-          <label>
-            PDF path
-            <input type="text" id="pdf-path" placeholder="/path/to/novel.pdf" required />
-          </label>
-          <label class="checkbox-row">
-            <input type="checkbox" id="rebuild" />
-            Force rebuild
-          </label>
-          <button type="submit">Start Ingest</button>
-        </form>
-        <pre id="ingest-status" class="status-box">No ingest job started.</pre>
-      </section>
-
-      <section class="card">
         <h2>Chat</h2>
-        <div id="chat-log" class="chat-log"></div>
+        <div id="chat-log" class="chat-log" style="display: none"></div>
         <form id="chat-form" class="chat-form">
           <textarea id="question" rows="4" placeholder="Ask about your novel..." required></textarea>
           <label class="checkbox-row">
@@ -48,31 +27,245 @@
           </label>
           <button type="submit">Ask</button>
         </form>
-        <pre id="response-meta" class="status-box">No responses yet.</pre>
+        <pre id="response-meta" class="status-box" hidden>No responses yet.</pre>
         <div>
-          <h3>Last Citations</h3>
+          <h3>Citations Used</h3>
           <ul id="citation-list"></ul>
         </div>
       </section>
     </main>
 
-    <script>
+      <script>
       const sessionId = "{{ session_id }}";
-      let activeIngestJob = null;
-
-      const ingestForm = document.getElementById("ingest-form");
-      const ingestStatus = document.getElementById("ingest-status");
       const chatForm = document.getElementById("chat-form");
       const chatLog = document.getElementById("chat-log");
       const citationList = document.getElementById("citation-list");
       const responseMeta = document.getElementById("response-meta");
+      const askButton = chatForm.querySelector('button[type="submit"]');
+      let pendingGeneratingEntry = null;
+      let generatingTicker = null;
+
+      function setChatLogVisible(visible) {
+        chatLog.style.display = visible ? "grid" : "none";
+      }
+
+      function syncChatLogVisibility() {
+        setChatLogVisible(chatLog.childElementCount > 0);
+      }
+
+      function escapeHtml(input) {
+        return String(input)
+          .replaceAll("&", "&amp;")
+          .replaceAll("<", "&lt;")
+          .replaceAll(">", "&gt;")
+          .replaceAll('"', "&quot;")
+          .replaceAll("'", "&#39;");
+      }
+
+      function renderInlineMarkdown(text) {
+        const codeTokens = [];
+        const withCodeTokens = String(text).replace(/`([^`\n]+?)`/g, (_, code) => {
+          const token = `@@CODE_TOKEN_${codeTokens.length}@@`;
+          codeTokens.push(`<code>${escapeHtml(code)}</code>`);
+          return token;
+        });
+
+        let html = escapeHtml(withCodeTokens);
+        html = html.replace(/\[([^\]\n]+)\]\((https?:\/\/[^\s)]+)\)/g, (_match, label, url) => {
+          return `<a href="${url}" target="_blank" rel="noopener noreferrer">${label}</a>`;
+        });
+        html = html.replace(/\*\*([^*\n]+)\*\*/g, "<strong>$1</strong>");
+        html = html.replace(/__([^_\n]+)__/g, "<strong>$1</strong>");
+        html = html.replace(/\*([^*\n]+)\*/g, "<em>$1</em>");
+        html = html.replace(/_([^_\n]+)_/g, "<em>$1</em>");
+        html = html.replace(/@@CODE_TOKEN_(\d+)@@/g, (_match, index) => {
+          return codeTokens[Number(index)] || "";
+        });
+
+        return html;
+      }
+
+      function renderMarkdown(markdown) {
+        const normalized = String(markdown || "").replace(/\r\n?/g, "\n").trim();
+        if (!normalized) {
+          return "";
+        }
+
+        const codeBlocks = [];
+        const withCodeTokens = normalized.replace(/```([a-zA-Z0-9_-]+)?\n([\s\S]*?)```/g, (_match, lang, code) => {
+          const token = `@@CODE_BLOCK_${codeBlocks.length}@@`;
+          const language = lang ? ` class="language-${escapeHtml(lang)}"` : "";
+          const escapedCode = escapeHtml(code).replace(/\n$/, "");
+          codeBlocks.push(`<pre><code${language}>${escapedCode}</code></pre>`);
+          return `\n${token}\n`;
+        });
+
+        const lines = withCodeTokens.split("\n");
+        const html = [];
+        const paragraph = [];
+        let inUnorderedList = false;
+        let inOrderedList = false;
+
+        const closeLists = () => {
+          if (inUnorderedList) {
+            html.push("</ul>");
+            inUnorderedList = false;
+          }
+          if (inOrderedList) {
+            html.push("</ol>");
+            inOrderedList = false;
+          }
+        };
+
+        const flushParagraph = () => {
+          if (paragraph.length === 0) {
+            return;
+          }
+          const content = paragraph.map((line) => renderInlineMarkdown(line)).join("<br />");
+          html.push(`<p>${content}</p>`);
+          paragraph.length = 0;
+        };
+
+        for (const rawLine of lines) {
+          const line = rawLine.trimEnd();
+          const trimmed = line.trim();
+
+          if (!trimmed) {
+            flushParagraph();
+            closeLists();
+            continue;
+          }
+
+          const codeTokenMatch = trimmed.match(/^@@CODE_BLOCK_(\d+)@@$/);
+          if (codeTokenMatch) {
+            flushParagraph();
+            closeLists();
+            html.push(codeBlocks[Number(codeTokenMatch[1])] || "");
+            continue;
+          }
+
+          const headingMatch = trimmed.match(/^(#{1,6})\s+(.+)$/);
+          if (headingMatch) {
+            flushParagraph();
+            closeLists();
+            const level = headingMatch[1].length;
+            html.push(`<h${level}>${renderInlineMarkdown(headingMatch[2])}</h${level}>`);
+            continue;
+          }
+
+          const blockquoteMatch = trimmed.match(/^>\s?(.*)$/);
+          if (blockquoteMatch) {
+            flushParagraph();
+            closeLists();
+            html.push(`<blockquote>${renderInlineMarkdown(blockquoteMatch[1])}</blockquote>`);
+            continue;
+          }
+
+          const unorderedMatch = line.match(/^\s*[-*+]\s+(.+)$/);
+          if (unorderedMatch) {
+            flushParagraph();
+            if (inOrderedList) {
+              html.push("</ol>");
+              inOrderedList = false;
+            }
+            if (!inUnorderedList) {
+              html.push("<ul>");
+              inUnorderedList = true;
+            }
+            html.push(`<li>${renderInlineMarkdown(unorderedMatch[1])}</li>`);
+            continue;
+          }
+
+          const orderedMatch = line.match(/^\s*\d+\.\s+(.+)$/);
+          if (orderedMatch) {
+            flushParagraph();
+            if (inUnorderedList) {
+              html.push("</ul>");
+              inUnorderedList = false;
+            }
+            if (!inOrderedList) {
+              html.push("<ol>");
+              inOrderedList = true;
+            }
+            html.push(`<li>${renderInlineMarkdown(orderedMatch[1])}</li>`);
+            continue;
+          }
+
+          paragraph.push(trimmed);
+        }
+
+        flushParagraph();
+        closeLists();
+        return html.join("");
+      }
 
       function appendChat(role, text) {
         const wrapper = document.createElement("div");
         wrapper.className = `chat-entry ${role}`;
-        wrapper.innerText = `${role.toUpperCase()}: ${text}`;
+
+        const roleLabel = document.createElement("div");
+        roleLabel.className = "chat-role";
+        roleLabel.textContent = role.toUpperCase();
+
+        const content = document.createElement("div");
+        content.className = "chat-content";
+        if (role === "assistant") {
+          content.innerHTML = renderMarkdown(text);
+        } else {
+          content.textContent = text;
+        }
+
+        wrapper.appendChild(roleLabel);
+        wrapper.appendChild(content);
         chatLog.appendChild(wrapper);
+        syncChatLogVisibility();
         chatLog.scrollTop = chatLog.scrollHeight;
+      }
+
+      function appendGeneratingIndicator() {
+        if (pendingGeneratingEntry) {
+          return;
+        }
+
+        const wrapper = document.createElement("div");
+        wrapper.className = "chat-entry assistant generating";
+
+        const roleLabel = document.createElement("div");
+        roleLabel.className = "chat-role";
+        roleLabel.textContent = "ASSISTANT";
+
+        const content = document.createElement("div");
+        content.className = "chat-content";
+        content.innerHTML = `
+          <p class="generating-text"><span class="generating-label">Generating</span></p>
+        `;
+
+        wrapper.appendChild(roleLabel);
+        wrapper.appendChild(content);
+        chatLog.appendChild(wrapper);
+        syncChatLogVisibility();
+        chatLog.scrollTop = chatLog.scrollHeight;
+        pendingGeneratingEntry = wrapper;
+
+        const label = content.querySelector(".generating-label");
+        let phase = 0;
+        generatingTicker = window.setInterval(() => {
+          phase = (phase + 1) % 4;
+          label.textContent = `Generating${".".repeat(phase)}`;
+        }, 300);
+      }
+
+      function clearGeneratingIndicator() {
+        if (generatingTicker) {
+          window.clearInterval(generatingTicker);
+          generatingTicker = null;
+        }
+        if (!pendingGeneratingEntry) {
+          return;
+        }
+        pendingGeneratingEntry.remove();
+        pendingGeneratingEntry = null;
+        syncChatLogVisibility();
       }
 
       function renderCitations(citations) {
@@ -94,9 +287,11 @@
       function renderResponseMeta(data) {
         if (!data) {
           responseMeta.textContent = "No responses yet.";
+          responseMeta.hidden = true;
           return;
         }
 
+        responseMeta.hidden = false;
         responseMeta.textContent = JSON.stringify(
           {
             mode: data.mode,
@@ -109,53 +304,6 @@
         );
       }
 
-      async function pollIngestStatus() {
-        if (!activeIngestJob) {
-          return;
-        }
-
-        const response = await fetch(`/api/ingest/${activeIngestJob}`);
-        if (!response.ok) {
-          ingestStatus.textContent = `Failed to fetch status: ${response.status}`;
-          return;
-        }
-
-        const status = await response.json();
-        ingestStatus.textContent = JSON.stringify(status, null, 2);
-
-        if (status.status === "completed" || status.status === "failed") {
-          activeIngestJob = null;
-          return;
-        }
-
-        setTimeout(pollIngestStatus, 1500);
-      }
-
-      ingestForm.addEventListener("submit", async (event) => {
-        event.preventDefault();
-        const payload = {
-          docx_path: document.getElementById("docx-path").value,
-          pdf_path: document.getElementById("pdf-path").value,
-          rebuild: document.getElementById("rebuild").checked,
-        };
-
-        const response = await fetch("/api/ingest", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(payload),
-        });
-
-        const data = await response.json();
-        if (!response.ok) {
-          ingestStatus.textContent = JSON.stringify(data, null, 2);
-          return;
-        }
-
-        activeIngestJob = data.job_id;
-        ingestStatus.textContent = `Ingest job started: ${activeIngestJob}`;
-        pollIngestStatus();
-      });
-
       chatForm.addEventListener("submit", async (event) => {
         event.preventDefault();
         const question = document.getElementById("question").value.trim();
@@ -164,6 +312,8 @@
         }
 
         appendChat("user", question);
+        askButton.disabled = true;
+        appendGeneratingIndicator();
 
         const payload = {
           session_id: sessionId,
@@ -172,23 +322,34 @@
           verbose: document.getElementById("verbose").checked,
         };
 
-        const response = await fetch("/api/chat", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(payload),
-        });
+        try {
+          const response = await fetch("/api/chat", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(payload),
+          });
 
-        const data = await response.json();
-        if (!response.ok) {
-          appendChat("assistant", data.error || "Request failed");
-          return;
+          const data = await response.json();
+          clearGeneratingIndicator();
+
+          if (!response.ok) {
+            appendChat("assistant", data.error || "Request failed");
+            return;
+          }
+
+          appendChat("assistant", data.answer_markdown);
+          renderCitations(data.citations || []);
+          renderResponseMeta(data);
+          document.getElementById("question").value = "";
+        } catch (_error) {
+          clearGeneratingIndicator();
+          appendChat("assistant", "Request failed");
+        } finally {
+          askButton.disabled = false;
         }
-
-        appendChat("assistant", data.answer_markdown);
-        renderCitations(data.citations || []);
-        renderResponseMeta(data);
-        document.getElementById("question").value = "";
       });
+
+      syncChatLogVisibility();
     </script>
   </body>
 </html>
