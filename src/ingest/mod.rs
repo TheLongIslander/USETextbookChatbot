@@ -234,10 +234,17 @@ impl Ingestor {
 fn build_chunks(units: Vec<SourceUnit>, target_tokens: usize, overlap_tokens: usize) -> Vec<Chunk> {
     let mut chunks = Vec::new();
 
+    let mut current_source_hash: Option<String> = None;
     let mut current_part: Option<String> = None;
     let mut current_part_index: Option<i64> = None;
 
     for mut unit in units {
+        if current_source_hash.as_deref() != Some(unit.source_hash.as_str()) {
+            current_source_hash = Some(unit.source_hash.clone());
+            current_part = None;
+            current_part_index = None;
+        }
+
         let normalized = normalize_text(&unit.content);
         if normalized.is_empty() {
             continue;
@@ -331,11 +338,23 @@ fn normalize_text(text: &str) -> String {
 
 pub(crate) fn detect_part_marker(line: &str) -> Option<(String, i64)> {
     let cleaned = line.replace('\u{200B}', "").trim().to_string();
-    let re = Regex::new(r"(?i)^\s*part\s*([0-9]{1,2})\s*([ab])?(?:\s*[:\-]\s*.*)?$")
+    if cleaned.is_empty() || cleaned.len() > 80 {
+        return None;
+    }
+    if cleaned.split_whitespace().count() > 8 {
+        return None;
+    }
+
+    let re = Regex::new(
+        r"(?i)^part\s*([0-9]{1,2}|[ivx]{1,5})\s*([ab])?(?:\s*[:\-–—]?\s*[A-Za-z0-9][A-Za-z0-9 '\-]*)?$",
+    )
         .unwrap_or_else(|_| Regex::new("^$").unwrap());
     let caps = re.captures(&cleaned)?;
 
-    let number = caps.get(1)?.as_str().parse::<i64>().ok()?;
+    let number = parse_part_number(caps.get(1)?.as_str())?;
+    if !(1..=20).contains(&number) {
+        return None;
+    }
     let suffix = caps
         .get(2)
         .map(|m| m.as_str().to_ascii_uppercase())
@@ -351,7 +370,45 @@ pub(crate) fn detect_part_marker(line: &str) -> Option<(String, i64)> {
 }
 
 pub(crate) fn detect_part_marker_anywhere(text: &str) -> Option<(String, i64)> {
-    text.lines().take(12).find_map(detect_part_marker)
+    text.lines().take(24).find_map(detect_part_marker)
+}
+
+fn parse_part_number(raw: &str) -> Option<i64> {
+    if let Ok(v) = raw.parse::<i64>() {
+        return Some(v);
+    }
+
+    roman_to_int(raw)
+}
+
+fn roman_to_int(raw: &str) -> Option<i64> {
+    let value = raw.trim().to_ascii_uppercase();
+    if value.is_empty() || value.len() > 6 {
+        return None;
+    }
+
+    let mut total = 0i64;
+    let mut prev = 0i64;
+    for ch in value.chars().rev() {
+        let n = match ch {
+            'I' => 1,
+            'V' => 5,
+            'X' => 10,
+            _ => return None,
+        };
+        if n < prev {
+            total -= n;
+        } else {
+            total += n;
+            prev = n;
+        }
+    }
+
+    if total <= 0 {
+        None
+    } else {
+        Some(total)
+    }
 }
 
 fn build_entity_mentions(chunks: &[Chunk]) -> Vec<EntityMention> {
@@ -455,6 +512,55 @@ mod tests {
         let part = detect_part_marker("Part 7a: Return Arc").expect("part");
         assert_eq!(part.0, "Part 7A");
         assert_eq!(part.1, 71);
+    }
+
+    #[test]
+    fn detects_part_label_variants() {
+        let part = detect_part_marker("Part IV Prelude").expect("roman part");
+        assert_eq!(part.0, "Part 4");
+        assert_eq!(part.1, 40);
+
+        let part = detect_part_marker("Part 5 Finale").expect("subtitle part");
+        assert_eq!(part.0, "Part 5");
+        assert_eq!(part.1, 50);
+    }
+
+    #[test]
+    fn rejects_narrative_part_reference() {
+        assert!(
+            detect_part_marker("Part 1 was, by far, the most chaotic part of the game.").is_none()
+        );
+    }
+
+    #[test]
+    fn part_state_resets_when_source_changes() {
+        let units = vec![
+            SourceUnit {
+                kind: SourceType::DocxText,
+                chapter: None,
+                part: Some("Part 7B".to_string()),
+                part_index: Some(72),
+                page: None,
+                content: "Late docx section".to_string(),
+                source_hash: "docx_hash".to_string(),
+                image_path: None,
+            },
+            SourceUnit {
+                kind: SourceType::PdfText,
+                chapter: None,
+                part: None,
+                part_index: None,
+                page: Some(1),
+                content: "Early pdf page".to_string(),
+                source_hash: "pdf_hash".to_string(),
+                image_path: None,
+            },
+        ];
+
+        let chunks = build_chunks(units, 64, 8);
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].part.as_deref(), Some("Part 7B"));
+        assert_eq!(chunks[1].part, None);
     }
 
     #[test]

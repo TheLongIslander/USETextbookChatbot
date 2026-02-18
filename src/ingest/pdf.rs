@@ -61,12 +61,13 @@ async fn extract_pdf_text_units(pdf_path: &Path, source_hash: &str) -> Result<Ve
                     continue;
                 }
 
-                let content = normalize_text(String::from_utf8_lossy(&output.stdout).as_ref());
+                let raw_text = String::from_utf8_lossy(&output.stdout).to_string();
+                let content = normalize_text(&raw_text);
                 if content.is_empty() {
                     continue;
                 }
 
-                if let Some((part, part_index)) = detect_part_marker_anywhere(&content) {
+                if let Some((part, part_index)) = detect_part_marker_anywhere(&raw_text) {
                     current_part = Some(part);
                     current_part_index = Some(part_index);
                 }
@@ -94,7 +95,7 @@ async fn extract_pdf_text_units(pdf_path: &Path, source_hash: &str) -> Result<Ve
 
         let content = normalize_text(&extracted);
         if !content.is_empty() {
-            let (part, part_index) = detect_part_marker_anywhere(&content)
+            let (part, part_index) = detect_part_marker_anywhere(&extracted)
                 .map_or((None, None), |(p, idx)| (Some(p), Some(idx)));
             units.push(SourceUnit {
                 kind: SourceType::PdfText,

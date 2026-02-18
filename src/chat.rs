@@ -25,6 +25,12 @@ struct ContextSource {
     rowid: Option<i64>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RequestedPartScope {
+    Number(i64),
+    Exact(i64),
+}
+
 #[derive(Clone)]
 pub struct ChatService {
     config: AppConfig,
@@ -70,6 +76,7 @@ impl ChatService {
             .map_err(anyhow::Error::from)?;
 
         let resolved_question = resolve_question_with_history(&request.question, &recent_history);
+        let requested_part_scope = extract_requested_part_scope(&resolved_question);
         let query_class = self.classify_query(&resolved_question).await;
         let expanded_question = expand_question_for_retrieval(&resolved_question);
         let broad_retrieval = is_broad_retrieval_query(&resolved_question);
@@ -115,12 +122,18 @@ impl ChatService {
 
         let mut mode = AnswerMode::TextOnly;
         let mut context_sources = self.build_context_sources(selected).await?;
+        if let Some(scope) = requested_part_scope {
+            context_sources = filter_sources_to_part_scope(context_sources, scope);
+        }
         context_sources = rebalance_context_sources(
             &resolved_question,
             context_sources,
             self.config.tokens.max_context_tokens,
             10,
         );
+        if let Some(scope) = requested_part_scope {
+            context_sources = filter_sources_to_part_scope(context_sources, scope);
+        }
         if context_sources.is_empty() {
             let answer = ChatAnswer {
                 answer_markdown: NOT_FOUND_MESSAGE.to_string(),
@@ -177,6 +190,11 @@ impl ChatService {
         }
 
         let history = recent_history;
+        let max_output_tokens = effective_output_tokens(
+            &resolved_question,
+            request.verbose,
+            self.config.tokens.max_output_tokens,
+        );
 
         let prompt = build_answer_prompt(
             &request.question,
@@ -185,7 +203,7 @@ impl ChatService {
             request.strict,
             request.verbose,
             &source_ids,
-            self.config.tokens.max_output_tokens,
+            max_output_tokens,
         );
 
         let _permit = self.generation_limit.acquire().await?;
@@ -194,29 +212,38 @@ impl ChatService {
             .generate_text(
                 &self.config.models.answer_model,
                 &prompt,
-                self.config.tokens.max_output_tokens,
+                max_output_tokens,
                 0.1,
             )
             .await
             .unwrap_or_else(|_| NOT_FOUND_MESSAGE.to_string());
         answer_text = sanitize_model_output(answer_text);
 
-        if request.strict && !has_source_citation(&answer_text) {
+        if request.strict
+            && !strict_citation_requirements_met(&answer_text, &resolved_question, &source_ids)
+        {
             let repaired = self
                 .repair_answer_with_citations(
                     &request.question,
                     &context,
                     &answer_text,
                     &source_ids,
+                    max_output_tokens,
                 )
                 .await
                 .unwrap_or_default();
 
-            if has_source_citation(&repaired) {
+            if strict_citation_requirements_met(&repaired, &resolved_question, &source_ids) {
                 answer_text = repaired;
             }
         }
         answer_text = sanitize_model_output(answer_text);
+
+        if request.strict
+            && !strict_citation_requirements_met(&answer_text, &resolved_question, &source_ids)
+        {
+            answer_text = NOT_FOUND_MESSAGE.to_string();
+        }
 
         if let Some(direct_answer) =
             direct_death_answer_from_sources(&request.question, &context_sources)
@@ -228,6 +255,12 @@ impl ChatService {
             direct_part_answer_from_sources(&request.question, &context_sources)
         {
             answer_text = part_answer;
+        }
+
+        if request.strict
+            && !strict_citation_requirements_met(&answer_text, &resolved_question, &source_ids)
+        {
+            answer_text = NOT_FOUND_MESSAGE.to_string();
         }
 
         answer_text = enforce_strict_mode(answer_text, request.strict);
@@ -325,7 +358,9 @@ impl ChatService {
         context: &str,
         draft_answer: &str,
         source_ids: &[String],
+        max_output_tokens: usize,
     ) -> Result<String> {
+        let min_citations = minimum_required_unique_citations(question, source_ids.len());
         let prompt = format!(
             "You are repairing a strict-citation answer.\n\
              Allowed source tags: {}.\n\
@@ -333,18 +368,20 @@ impl ChatService {
              - Rewrite the answer using only the provided context.\n\
              - Every factual sentence must include at least one source tag like [S1].\n\
              - Use only allowed tags above.\n\
+             - Use at least {} distinct source tags when enough evidence exists.\n\
              - If evidence is insufficient, return exactly: {NOT_FOUND_MESSAGE}\n\n\
              Question:\n{question}\n\n\
              Context:\n{context}\n\n\
              Draft answer:\n{draft_answer}\n",
-            source_ids.join(", ")
+            source_ids.join(", "),
+            min_citations
         );
 
         self.ollama
             .generate_text(
                 &self.config.models.answer_model,
                 &prompt,
-                self.config.tokens.max_output_tokens,
+                max_output_tokens,
                 0.0,
             )
             .await
@@ -378,8 +415,7 @@ impl ChatService {
         } else {
             vec![]
         };
-        let include_timeline =
-            is_overview_query(question) || is_later_query(question) || is_part_query(question);
+        let include_timeline = is_broad_retrieval_query(question);
         let timeline_candidates = if include_timeline {
             self.collect_timeline_candidates(&anchor_terms, 220).await?
         } else {
@@ -708,6 +744,7 @@ fn expand_question_for_retrieval(question: &str) -> String {
     let mut expanded = question.to_string();
     let mut additions = Vec::new();
     let mut seen = HashSet::new();
+    let requested_part_scope = extract_requested_part_scope(question);
 
     if is_death_question(question) {
         for term in [
@@ -751,7 +788,7 @@ fn expand_question_for_retrieval(question: &str) -> String {
         }
     }
 
-    if is_overview_query(question) {
+    if is_overview_query(question) && requested_part_scope.is_none() {
         for term in [
             "overview",
             "summary",
@@ -765,9 +802,41 @@ fn expand_question_for_retrieval(question: &str) -> String {
         }
     }
 
-    if is_later_query(question) {
+    if is_later_query(question) && requested_part_scope.is_none() {
         for term in ["later", "end", "final", "aftermath", "eventually"] {
             push_unique_term(&mut additions, &mut seen, term);
+        }
+    }
+
+    if let Some(scope) = requested_part_scope {
+        match scope {
+            RequestedPartScope::Number(number) => {
+                for term in [
+                    format!("part {number}"),
+                    format!("part {number}a"),
+                    format!("part {number}b"),
+                ] {
+                    push_unique_term(&mut additions, &mut seen, &term);
+                }
+            }
+            RequestedPartScope::Exact(part_index) => {
+                let number = part_index / 10;
+                let suffix = match part_index % 10 {
+                    1 => "a",
+                    2 => "b",
+                    _ => "",
+                };
+
+                if suffix.is_empty() {
+                    let term = format!("part {number}");
+                    push_unique_term(&mut additions, &mut seen, &term);
+                } else {
+                    let exact = format!("part {number}{suffix}");
+                    push_unique_term(&mut additions, &mut seen, &exact);
+                    let broad = format!("part {number}");
+                    push_unique_term(&mut additions, &mut seen, &broad);
+                }
+            }
         }
     }
 
@@ -879,7 +948,15 @@ fn summary_focus_entity(
     strong_anchors: &[String],
     anchors: &[String],
 ) -> Option<String> {
-    if !(is_overview_query(question) || is_later_query(question) || is_part_query(question)) {
+    if extract_requested_part_scope(question).is_some() {
+        return None;
+    }
+
+    if !(is_overview_query(question)
+        || is_comparison_query(question)
+        || is_later_query(question)
+        || is_part_query(question))
+    {
         return None;
     }
 
@@ -963,20 +1040,119 @@ fn select_entity_summary_spine(
 }
 
 fn temporal_bucket_by_part(part_index: Option<i64>) -> usize {
-    let Some(index) = part_index else {
+    let Some(part_number) = part_number_from_part_index(part_index) else {
         return 1;
     };
-    if index < 30 {
+    if part_number <= 3 {
         0
-    } else if index < 60 {
+    } else if part_number <= 6 {
         1
     } else {
         2
     }
 }
 
+fn part_number_from_part_index(part_index: Option<i64>) -> Option<i64> {
+    let index = part_index?;
+    if index <= 0 {
+        return None;
+    }
+    Some(index / 10)
+}
+
+fn extract_requested_part_scope(question: &str) -> Option<RequestedPartScope> {
+    let re = Regex::new(r"(?i)\bpart\s+([0-9]{1,2}|[ivx]{1,5})\s*([ab])?\b")
+        .unwrap_or_else(|_| Regex::new("^$").unwrap());
+    let caps = re.captures(question)?;
+    let number = parse_part_number_token(caps.get(1)?.as_str())?;
+    if !(1..=20).contains(&number) {
+        return None;
+    }
+
+    let suffix = caps
+        .get(2)
+        .map(|m| m.as_str().to_ascii_uppercase())
+        .unwrap_or_default();
+    let scope = match suffix.as_str() {
+        "A" => RequestedPartScope::Exact(number * 10 + 1),
+        "B" => RequestedPartScope::Exact(number * 10 + 2),
+        _ => RequestedPartScope::Number(number),
+    };
+
+    Some(scope)
+}
+
+fn parse_part_number_token(raw: &str) -> Option<i64> {
+    if let Ok(value) = raw.parse::<i64>() {
+        return Some(value);
+    }
+    roman_to_int_token(raw)
+}
+
+fn roman_to_int_token(raw: &str) -> Option<i64> {
+    let value = raw.trim().to_ascii_uppercase();
+    if value.is_empty() || value.len() > 6 {
+        return None;
+    }
+
+    let mut total = 0i64;
+    let mut prev = 0i64;
+    for ch in value.chars().rev() {
+        let n = match ch {
+            'I' => 1,
+            'V' => 5,
+            'X' => 10,
+            _ => return None,
+        };
+        if n < prev {
+            total -= n;
+        } else {
+            total += n;
+            prev = n;
+        }
+    }
+
+    if total <= 0 {
+        None
+    } else {
+        Some(total)
+    }
+}
+
+fn source_matches_part_scope(source: &ContextSource, scope: RequestedPartScope) -> bool {
+    let Some(part_index) = source.part_index else {
+        return false;
+    };
+
+    match scope {
+        RequestedPartScope::Exact(expected) => part_index == expected,
+        RequestedPartScope::Number(expected_number) => {
+            part_number_from_part_index(Some(part_index)) == Some(expected_number)
+        }
+    }
+}
+
+fn filter_sources_to_part_scope(
+    sources: Vec<ContextSource>,
+    scope: RequestedPartScope,
+) -> Vec<ContextSource> {
+    let mut filtered: Vec<ContextSource> = sources
+        .into_iter()
+        .filter(|source| source_matches_part_scope(source, scope))
+        .collect();
+    renumber_sources(&mut filtered);
+    filtered
+}
+
 fn is_broad_retrieval_query(question: &str) -> bool {
-    is_overview_query(question) || is_later_query(question) || is_part_query(question)
+    if extract_requested_part_scope(question).is_some() {
+        return false;
+    }
+
+    is_overview_query(question)
+        || is_comparison_query(question)
+        || is_later_query(question)
+        || is_part_query(question)
 }
 
 fn rerank_candidates(question: &str, retrieved: Vec<RetrievalResult>) -> Vec<RetrievalResult> {
@@ -986,8 +1162,10 @@ fn rerank_candidates(question: &str, retrieved: Vec<RetrievalResult>) -> Vec<Ret
 
     let question_terms = normalized_question_terms(question);
     let entity = extract_primary_entity(question);
-    let later_query = is_later_query(question);
-    let overview_query = is_overview_query(question);
+    let has_part_scope = extract_requested_part_scope(question).is_some();
+    let later_query = !has_part_scope && is_later_query(question);
+    let overview_query =
+        !has_part_scope && (is_overview_query(question) || is_comparison_query(question));
 
     let mut reranked = retrieved;
     for item in &mut reranked {
@@ -1224,6 +1402,11 @@ fn anchor_stopwords() -> HashSet<&'static str> {
         "or",
         "if",
         "then",
+        "part",
+        "chapter",
+        "section",
+        "summary",
+        "summarize",
         "about",
         "book",
         "novel",
@@ -1295,6 +1478,15 @@ fn is_overview_query(question: &str) -> bool {
         || q.contains("tell me about")
         || q.contains("more information about")
         || q.contains("profile of")
+}
+
+fn is_comparison_query(question: &str) -> bool {
+    let q = question.to_ascii_lowercase();
+    q.contains("who would win")
+        || q.contains(" in a fight")
+        || q.contains("versus")
+        || q.contains(" vs ")
+        || q.contains(" vs. ")
 }
 
 fn is_later_query(question: &str) -> bool {
@@ -1435,8 +1627,7 @@ fn trim_to_context_budget(
         return vec![];
     }
 
-    let broad_query =
-        is_overview_query(question) || is_later_query(question) || is_part_query(question);
+    let broad_query = is_broad_retrieval_query(question);
     let candidates: Vec<RetrievalResult> = retrieved
         .into_iter()
         .take(max_chunks.saturating_mul(6).max(max_chunks))
@@ -1521,8 +1712,13 @@ fn rebalance_context_sources(
         return vec![];
     }
 
-    let broad_query =
-        is_overview_query(question) || is_later_query(question) || is_part_query(question);
+    if extract_requested_part_scope(question).is_some() && is_overview_query(question) {
+        let mut out = select_chronological_spread_sources(sources, max_tokens, max_chunks);
+        renumber_sources(&mut out);
+        return out;
+    }
+
+    let broad_query = is_broad_retrieval_query(question);
     if !broad_query {
         let mut out = trim_context_sources_by_budget(sources, max_tokens, max_chunks);
         renumber_sources(&mut out);
@@ -1642,6 +1838,72 @@ fn rebalance_context_sources(
     selected
 }
 
+fn select_chronological_spread_sources(
+    mut sources: Vec<ContextSource>,
+    max_tokens: usize,
+    max_chunks: usize,
+) -> Vec<ContextSource> {
+    if sources.is_empty() || max_tokens == 0 || max_chunks == 0 {
+        return vec![];
+    }
+
+    sources.sort_by_key(|s| s.rowid.unwrap_or(i64::MAX));
+    let n = sources.len();
+    let target = n.min(max_chunks);
+    let indices: Vec<usize> = (0..target)
+        .map(|i| ((n - 1) * i) / (target.saturating_sub(1).max(1)))
+        .collect();
+
+    let mut selected = Vec::new();
+    let mut seen = HashSet::new();
+    let mut total_tokens = 0usize;
+
+    for idx in indices {
+        let src = sources[idx].clone();
+        if seen.contains(&src.result.chunk.id) {
+            continue;
+        }
+
+        let chunk_tokens = src.result.chunk.token_count.max(0) as usize;
+        if chunk_tokens > max_tokens || total_tokens + chunk_tokens > max_tokens {
+            continue;
+        }
+
+        seen.insert(src.result.chunk.id.clone());
+        total_tokens += chunk_tokens;
+        selected.push(src);
+    }
+
+    let mut by_score = sources;
+    by_score.sort_by(|a, b| {
+        b.result
+            .score
+            .partial_cmp(&a.result.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    for src in by_score {
+        if selected.len() >= max_chunks {
+            break;
+        }
+        if seen.contains(&src.result.chunk.id) {
+            continue;
+        }
+
+        let chunk_tokens = src.result.chunk.token_count.max(0) as usize;
+        if chunk_tokens > max_tokens || total_tokens + chunk_tokens > max_tokens {
+            continue;
+        }
+
+        seen.insert(src.result.chunk.id.clone());
+        total_tokens += chunk_tokens;
+        selected.push(src);
+    }
+
+    selected.sort_by_key(|s| s.rowid.unwrap_or(i64::MAX));
+    selected
+}
+
 fn trim_context_sources_by_budget(
     sources: Vec<ContextSource>,
     max_tokens: usize,
@@ -1734,22 +1996,32 @@ fn build_answer_prompt(
     source_ids: &[String],
     max_tokens: usize,
 ) -> String {
+    let requested_part_scope = extract_requested_part_scope(question);
     let history_text = history
         .iter()
         .map(|(role, text)| format!("{role}: {text}"))
         .collect::<Vec<_>>()
         .join("\n");
-    let synthesis_hint = if is_overview_query(question) || is_later_query(question) {
-        "When answering character/overview questions, explicitly cover early, middle, and most recent events. Prioritize the latest canon events if there is tension."
+    let synthesis_hint = if requested_part_scope.is_none()
+        && (is_overview_query(question)
+            || is_comparison_query(question)
+            || is_later_query(question))
+    {
+        "When answering character/overview/comparison questions, explicitly cover early (Parts 1-3), middle (Parts 4-6), and most recent events (Parts 7A-7B). Prioritize the latest canon events if there is tension."
     } else {
         ""
+    };
+    let scope_rule = if requested_part_scope.is_some() {
+        "The user requested a specific part. Use evidence only from that part scope."
+    } else {
+        "For overview/comparison/later questions, synthesize across early, middle, and late evidence."
     };
 
     let strict_rules = if strict {
         format!(
             "Rules: Use only the provided context. Cite sources inline like [S1] for every factual sentence. \
              Allowed source tags: {}. If evidence is missing, respond exactly: {NOT_FOUND_MESSAGE}. \
-             For overview/later questions, synthesize across early, middle, and late evidence. \
+             {scope_rule} \
              Never wrap your answer in code fences. {}",
             source_ids.join(", "),
             synthesis_hint
@@ -1757,14 +2029,18 @@ fn build_answer_prompt(
     } else {
         format!(
             "Rules: Prefer the provided context. Do not invent events or facts. If context is inconclusive, explicitly say so. \
-             Cite source tags like [S1] when possible. For overview/later questions, synthesize across early, middle, and late evidence. \
+             Cite source tags like [S1] when possible. {scope_rule} \
              Never wrap your answer in code fences. {}",
             synthesis_hint
         )
     };
 
     let style_rules = if verbose {
-        "Write a detailed markdown answer. For character/overview questions, include: (1) early arc, (2) middle arc, (3) latest arc, and (4) current status/implications. Keep claims grounded to cited evidence only."
+        if requested_part_scope.is_some() {
+            "Write a detailed markdown answer focused only on the requested part. Use multiple citations distributed across the answer, and do not use early/middle/latest arc sections unless the user asks for full-book coverage."
+        } else {
+            "Write a detailed markdown answer. For character/overview/comparison questions, include: (1) early arc, (2) middle arc, (3) latest arc, and (4) current status/implications. Keep claims grounded to cited evidence only."
+        }
     } else {
         "Write a concise markdown answer focused on direct evidence."
     };
@@ -1819,6 +2095,7 @@ fn build_citations(sources: &[ContextSource], answer: &str, strict: bool) -> Vec
             .join(" ");
 
         citations.push(Citation {
+            source_id: source.source_id.clone(),
             chunk_id: source.result.chunk.id.clone(),
             source_type: source.result.chunk.kind,
             chapter: source
@@ -1838,6 +2115,7 @@ fn build_citations(sources: &[ContextSource], answer: &str, strict: bool) -> Vec
 
         for source in sources {
             citations.push(Citation {
+                source_id: source.source_id.clone(),
                 chunk_id: source.result.chunk.id.clone(),
                 source_type: source.result.chunk.kind,
                 chapter: source
@@ -1881,6 +2159,122 @@ fn extract_source_markers(answer: &str) -> Vec<String> {
 fn has_source_citation(answer: &str) -> bool {
     let re = Regex::new(r"(?i)\[s\d+\]").unwrap_or_else(|_| Regex::new("^").unwrap());
     re.is_match(answer)
+}
+
+fn has_unknown_source_markers(answer: &str, source_ids: &[String]) -> bool {
+    if source_ids.is_empty() {
+        return !extract_source_markers(answer).is_empty();
+    }
+
+    let allowed: HashSet<String> = source_ids
+        .iter()
+        .map(|id| id.trim().to_ascii_uppercase())
+        .collect();
+
+    extract_source_markers(answer)
+        .into_iter()
+        .any(|marker| !allowed.contains(&marker.to_ascii_uppercase()))
+}
+
+fn minimum_required_unique_citations(question: &str, available_sources: usize) -> usize {
+    if available_sources <= 1 {
+        return available_sources.max(1);
+    }
+
+    if extract_requested_part_scope(question).is_some() && is_overview_query(question) {
+        return available_sources.min(2).max(1);
+    }
+
+    if is_overview_query(question) {
+        return available_sources.min(4).max(2);
+    }
+
+    if is_comparison_query(question) || is_later_query(question) {
+        return available_sources.min(2);
+    }
+
+    1
+}
+
+fn should_enforce_sentence_level_citations(question: &str) -> bool {
+    if extract_requested_part_scope(question).is_some() {
+        return false;
+    }
+
+    is_overview_query(question) || is_comparison_query(question) || is_later_query(question)
+}
+
+fn is_factual_segment(segment: &str) -> bool {
+    let trimmed = segment.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+
+    if trimmed.starts_with('#') || trimmed.starts_with('>') {
+        return false;
+    }
+
+    let meaningful_words = trimmed
+        .split_whitespace()
+        .filter(|word| {
+            let w = word.trim();
+            !w.is_empty() && !w.starts_with("[S") && !w.starts_with("[s")
+        })
+        .count();
+    if meaningful_words < 6 {
+        return false;
+    }
+
+    let alpha_chars = trimmed.chars().filter(|c| c.is_ascii_alphabetic()).count();
+    alpha_chars >= 16
+}
+
+fn has_uncited_factual_segment(answer: &str) -> bool {
+    let citation_re = Regex::new(r"(?i)\[s\d+\]").unwrap_or_else(|_| Regex::new("^").unwrap());
+
+    answer
+        .split('\n')
+        .flat_map(|line| line.split(['.', '!', '?']))
+        .filter(|segment| is_factual_segment(segment))
+        .any(|segment| !citation_re.is_match(segment))
+}
+
+fn strict_citation_requirements_met(answer: &str, question: &str, source_ids: &[String]) -> bool {
+    if answer.trim().eq_ignore_ascii_case(NOT_FOUND_MESSAGE) {
+        return true;
+    }
+
+    if !has_source_citation(answer) || has_unknown_source_markers(answer, source_ids) {
+        return false;
+    }
+
+    let unique_citations = extract_source_markers(answer).len();
+    if unique_citations < minimum_required_unique_citations(question, source_ids.len()) {
+        return false;
+    }
+
+    if should_enforce_sentence_level_citations(question) && has_uncited_factual_segment(answer) {
+        return false;
+    }
+
+    true
+}
+
+fn effective_output_tokens(question: &str, verbose: bool, base: usize) -> usize {
+    if base == 0 {
+        return 0;
+    }
+
+    let mut out = base;
+    if verbose {
+        out = out.saturating_mul(2);
+    }
+    if is_broad_retrieval_query(question) {
+        out = out.saturating_add(base / 2);
+    }
+
+    let cap = base.max(1400);
+    out.clamp(base, cap)
 }
 
 fn estimate_confidence(retrieved: &[RetrievalResult]) -> f32 {
@@ -2116,5 +2510,197 @@ mod tests {
             .filter(|s| s.rowid.unwrap_or(0) >= 180)
             .count();
         assert!(late_count >= 3);
+    }
+
+    #[test]
+    fn temporal_bucket_uses_defined_part_ranges() {
+        assert_eq!(temporal_bucket_by_part(Some(10)), 0);
+        assert_eq!(temporal_bucket_by_part(Some(30)), 0);
+        assert_eq!(temporal_bucket_by_part(Some(40)), 1);
+        assert_eq!(temporal_bucket_by_part(Some(60)), 1);
+        assert_eq!(temporal_bucket_by_part(Some(71)), 2);
+        assert_eq!(temporal_bucket_by_part(Some(72)), 2);
+    }
+
+    #[test]
+    fn detects_requested_part_scope() {
+        assert_eq!(
+            extract_requested_part_scope("Summarize Part 7"),
+            Some(RequestedPartScope::Number(7))
+        );
+        assert_eq!(
+            extract_requested_part_scope("Summarize Part 7A"),
+            Some(RequestedPartScope::Exact(71))
+        );
+        assert_eq!(
+            extract_requested_part_scope("Summarize Part VII"),
+            Some(RequestedPartScope::Number(7))
+        );
+    }
+
+    #[test]
+    fn scoped_part_summary_is_not_broad_query() {
+        assert!(!is_broad_retrieval_query("Summarize Part 7"));
+        assert!(is_broad_retrieval_query("Summarize Apollo345"));
+    }
+
+    #[test]
+    fn part_scope_filter_keeps_only_requested_part() {
+        let make_source = |id: &str, part_index: i64| ContextSource {
+            source_id: "S0".to_string(),
+            result: RetrievalResult {
+                chunk: Chunk {
+                    id: id.to_string(),
+                    content: format!("Event {id}"),
+                    kind: SourceType::DocxText,
+                    chapter: None,
+                    part: None,
+                    part_index: Some(part_index),
+                    page: None,
+                    token_count: 12,
+                    source_hash: "h".to_string(),
+                    image_path: None,
+                },
+                score: 0.5,
+            },
+            part: Some(format!("Part {}", part_index / 10)),
+            part_index: Some(part_index),
+            rowid: Some(part_index),
+        };
+
+        let filtered = filter_sources_to_part_scope(
+            vec![
+                make_source("p6", 60),
+                make_source("p7a", 71),
+                make_source("p7b", 72),
+            ],
+            RequestedPartScope::Number(7),
+        );
+        assert_eq!(filtered.len(), 2);
+        assert!(filtered
+            .iter()
+            .all(|s| { part_number_from_part_index(s.part_index) == Some(7) }));
+        assert_eq!(filtered[0].source_id, "S1");
+        assert_eq!(filtered[1].source_id, "S2");
+    }
+
+    #[test]
+    fn scoped_part_prompt_does_not_force_arc_sections() {
+        let prompt = build_answer_prompt(
+            "Summarize Part 7",
+            "Context",
+            &[],
+            true,
+            true,
+            &["S1".to_string()],
+            512,
+        );
+
+        assert!(prompt.contains("requested a specific part"));
+        assert!(!prompt.contains("include: (1) early arc, (2) middle arc, (3) latest arc"));
+    }
+
+    #[test]
+    fn who_would_win_queries_are_broad() {
+        let q = "Who would win in a fight - TheLongIslander or Leafsfan2003?";
+        assert!(is_comparison_query(q));
+        assert!(is_broad_retrieval_query(q));
+    }
+
+    #[test]
+    fn detects_unknown_source_markers() {
+        let source_ids = vec!["S1".to_string(), "S2".to_string()];
+        assert!(!has_unknown_source_markers(
+            "Supported [S1] and [S2].",
+            &source_ids
+        ));
+        assert!(has_unknown_source_markers("Unknown [S9].", &source_ids));
+    }
+
+    #[test]
+    fn strict_citation_requirements_reject_sparse_overview_citations() {
+        let source_ids = vec![
+            "S1".to_string(),
+            "S2".to_string(),
+            "S3".to_string(),
+            "S4".to_string(),
+            "S5".to_string(),
+        ];
+        let answer = "Part 7A opens with a forced-diversity challenge and a mysterious mission setup [S1]. Part 7B shifts to governance conflicts and retaliation threats tied to Geektown disputes [S2].";
+
+        assert!(!strict_citation_requirements_met(
+            answer,
+            "Summarize Apollo345's overall arc",
+            &source_ids
+        ));
+    }
+
+    #[test]
+    fn strict_citation_requirements_enforce_sentence_level_citations() {
+        let source_ids = vec!["S1".to_string(), "S2".to_string(), "S3".to_string()];
+        let answer = "Part 7A opens with a forced-diversity challenge and a mission briefing for the trio [S1]. The group advances toward the manor while still uncertain about who chose them. Part 7B records legal grievances around griefing and declared penalties affecting Geektown governance [S2]. The close emphasizes enforcement measures and faction-level consequences [S3].";
+
+        assert!(!strict_citation_requirements_met(
+            answer,
+            "Summarize Apollo345's overall arc",
+            &source_ids
+        ));
+    }
+
+    #[test]
+    fn strict_citation_requirements_accept_dense_overview_citations() {
+        let source_ids = vec![
+            "S1".to_string(),
+            "S2".to_string(),
+            "S3".to_string(),
+            "S4".to_string(),
+            "S5".to_string(),
+        ];
+        let answer = "Part 7A begins with TheLongIslander, BangladeshiJew, and Leafsfan2003 waking in a tent and finding mission-oriented instructions [S1]. The trio follows the guidance toward the manor while debating trust and intent behind the setup [S2]. Part 7B pivots to documented griefing allegations tied to Tax_Day's old property and disruption of rebuilding work [S3]. The final warnings outline banishment and war escalation as consequences for continued violations [S4].";
+
+        assert!(strict_citation_requirements_met(
+            answer,
+            "Summarize Part 7 of the book",
+            &source_ids
+        ));
+    }
+
+    #[test]
+    fn part_scoped_summary_needs_two_sources_not_four() {
+        let source_ids = vec![
+            "S1".to_string(),
+            "S2".to_string(),
+            "S3".to_string(),
+            "S4".to_string(),
+            "S5".to_string(),
+        ];
+        let answer = "Part 7A opens with the forced-diversity setup and mission instructions for the trio [S1]. Part 7B shifts to grievance documentation and explicit enforcement threats around Geektown disputes [S2].";
+
+        assert!(strict_citation_requirements_met(
+            answer,
+            "Summarize Part 7 of the book",
+            &source_ids
+        ));
+    }
+
+    #[test]
+    fn part_scoped_summary_does_not_require_every_sentence_cited() {
+        let source_ids = vec!["S1".to_string(), "S2".to_string(), "S3".to_string()];
+        let answer = "Part 7A opens with a forced-diversity challenge and mission setup [S1]. The group advances toward the manor while still uncertain about who chose them. Part 7B records griefing allegations and declared penalties tied to Geektown governance [S2].";
+
+        assert!(strict_citation_requirements_met(
+            answer,
+            "Summarize Part 7",
+            &source_ids
+        ));
+    }
+
+    #[test]
+    fn effective_output_tokens_expands_for_verbose_broad_queries() {
+        let base = 500;
+        let q = "Who would win in a fight - TheLongIslander or Leafsfan2003?";
+        let expanded = effective_output_tokens(q, true, base);
+        assert!(expanded > base);
+        assert!(expanded <= 1400);
     }
 }

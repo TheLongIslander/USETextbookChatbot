@@ -279,7 +279,8 @@
           const li = document.createElement("li");
           const chapter = c.chapter ? ` chapter=${c.chapter}` : "";
           const page = c.page ? ` page=${c.page}` : "";
-          li.textContent = `[${c.chunk_id}] ${c.source_type}${chapter}${page} score=${c.score.toFixed(3)} | ${c.snippet}`;
+          const sourceId = c.source_id || "?";
+          li.textContent = `[${sourceId}] chunk=${c.chunk_id} ${c.source_type}${chapter}${page} score=${c.score.toFixed(3)} | ${c.snippet}`;
           citationList.appendChild(li);
         }
       }

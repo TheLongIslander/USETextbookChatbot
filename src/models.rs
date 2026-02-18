@@ -56,6 +56,7 @@ pub struct ImageAsset {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Citation {
+    pub source_id: String,
     pub chunk_id: String,
     pub source_type: SourceType,
     pub chapter: Option<String>,
